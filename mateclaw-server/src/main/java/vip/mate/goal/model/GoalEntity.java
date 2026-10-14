@@ -135,6 +135,8 @@ public class GoalEntity {
     public int totalLlmCallsUsed() {
         int a = agentLlmCallsUsed != null ? agentLlmCallsUsed : 0;
         int e = evalLlmCallsUsed != null ? evalLlmCallsUsed : 0;
-        return a + e;
+        // A wrapped negative count would make an exhausted finite budget look unused.
+        // Keep the existing int API while saturating only at its representable maximum.
+        return (int) Math.min(Integer.MAX_VALUE, (long) a + e);
     }
 }

@@ -30,6 +30,9 @@ import vip.mate.agent.context.PrefixBudgetPlan;
 import vip.mate.agent.context.LoopMessageBudgeter;
 import vip.mate.agent.context.RuntimeContextInjector;
 import vip.mate.agent.context.TokenEstimator;
+import vip.mate.agent.context.BudgetedCompactionModel;
+import vip.mate.agent.context.BudgetedCompactionModel.CallBudgetExceeded;
+import vip.mate.agent.context.BudgetedCompactionModel.SummaryPromptOverflow;
 import vip.mate.agent.graph.state.FinishReason;
 import vip.mate.agent.graph.state.MateClawStateAccessor;
 import vip.mate.agent.graph.state.MateClawStateKeys;
@@ -100,18 +103,6 @@ public class ReasoningNode implements NodeAction {
      * raw message volume via {@code absoluteMaxMessages}.
      */
     private static final int DEFAULT_LOOP_CONTEXT_WINDOW_TOKENS = 128_000;
-
-    /**
-     * Conservative buffer added to the per-loop budget's reservedPrefixTokens
-     * to cover non-history prompt segments that are appended <em>after</em>
-     * the budget runs: the runtime-rendered skill catalog, runtime-context
-     * snapshot, wiki injection, progress ledger snapshot, and assorted
-     * marker SystemMessages. Underestimating here only delays the trigger
-     * slightly; loop invariants (anchor preservation, tool-pair integrity)
-     * are unaffected. Sized for a typical agent with 20–30 skills and
-     * moderate wiki content.
-     */
-    private static final int LOOP_PREFIX_AUXILIARY_RESERVE_TOKENS = 4_000;
 
     /**
      * DashScope's native chat API caps {@code max_tokens} at 8192 and returns a
@@ -372,11 +363,12 @@ public class ReasoningNode implements NodeAction {
             + "   每批最多 16 个 `progress_update`；超过 16 个时分批注册，避免超过执行器上限。\n"
             + "   例：要调研 10 个模型，第一轮就发 10 个 `progress_update(stepKey=\"model_xxx\", status=\"pending\")`。\n"
             + "2. **每开始一个子目标**前发 `progress_update(同 stepKey, status=\"in_progress\")`。\n"
-            + "3. **每完成一个子目标**后立即发 `progress_update(同 stepKey, status=\"done\")`。\n"
+            + "3. **收到并验证子目标的成功结果后**，在下一次行动中发 `progress_update(同 stepKey, status=\"done\")`。\n"
+            + "   不要在启动该操作的批次提前标记 done；可以把前一步的 done 更新与下一独立步骤的工具调用放在同一批次。\n"
             + "4. **无法继续**时发 `progress_update(同 stepKey, status=\"blocked\", note=\"具体原因\")`。\n\n"
             + "**为什么必须**：\n"
             + "- 系统在你**每一次推理前**注入一份 \"## 当前任务进度\" 快照。\n"
-            + "  这是你**唯一可信**的\"已完成清单\"——比你记忆里的步骤更权威，因为上下文窗口\n"
+            + "  这是持久保存的进度声明，done 本身不是执行成功或验收通过的证据；必须结合真实工具结果验证。上下文窗口\n"
             + "  会被裁剪，老的工具调用记录会消失，但 ledger 不会。\n"
             + "- 不维护 ledger 的后果（实测）：\n"
             + "  · 上下文裁剪后忘记自己做过的步骤，重复执行已完成项 → 浪费迭代预算\n"
@@ -778,6 +770,10 @@ public class ReasoningNode implements NodeAction {
             }
         }
 
+        if (!hasLlmCallBudget(accessor.maxIterations(), accessor.llmCallCount(), 1)) {
+            return retryBudgetStop(state, accessor.llmCallCount(), null);
+        }
+
         // ======= 构建 Prompt =======
         String systemPrompt = accessor.systemPrompt();
         // Tool-use enforcement is always appended: without it some models tend to
@@ -791,51 +787,6 @@ public class ReasoningNode implements NodeAction {
         // always-on for the runtime LLM.
         systemPrompt = buildGroundedSystemPrompt(systemPrompt, hasWikiTool());
         List<Message> messages = accessor.messages();
-
-        // Per-loop budget: bound the working message list a single Reasoning
-        // iteration hands to the LLM. The previous fixed head=4 + tail=36 cut
-        // could lose the latest UserMessage once the ReAct loop accumulated
-        // tool calls/observations past ~70 messages — the user's question
-        // fell into the dropped middle, the LLM lost it, and the agent
-        // answered off-topic. LoopMessageBudgeter anchors the latest
-        // UserMessage as undroppable, sizes the tail by token budget instead
-        // of message count, and keeps the same bidirectional tool-pair
-        // integrity guard the old block already had. The L2 trim here is
-        // distinct from ConversationWindowManager (L1): L1 runs once per
-        // user turn and produces an LLM summary for multi-turn history; L2
-        // runs per reasoning iteration on what L1 already produced plus
-        // intra-turn tool-call growth.
-        //
-        // Reserved prefix tokens cover the non-history portion of the
-        // prompt the LLM will receive: system prompt (with tool-use
-        // enforcement already appended), tool schemas, output reserve,
-        // and a buffer for skill catalog + runtime context + wiki
-        // injections that are added downstream. Underestimating here only
-        // delays the trigger slightly — invariants (anchor, pair integrity)
-        // still hold once budget fires.
-        int systemTokens = TokenEstimator.estimateTokens(systemPrompt);
-        int toolsTokens = TokenEstimator.estimateToolsTokens(toolCallbacks);
-        int loopReservedPrefixTokens = systemTokens + toolsTokens
-                + maxOutputTokens + LOOP_PREFIX_AUXILIARY_RESERVE_TOKENS;
-        LoopBudgetConfig loopCfg = LoopBudgetConfig.forContext(loopContextWindowTokens())
-                .withReservedPrefixTokens(loopReservedPrefixTokens);
-        LoopMessageBudgeter.Result budgeted = LOOP_BUDGETER.budget(messages, loopCfg);
-        // Only log when the budget actually modified the list — a triggered-
-        // but-no-op pass is normal (history fits comfortably under the tail
-        // budget) and would otherwise spam logs every iteration.
-        if (budgeted.trace().modified()) {
-            LoopMessageBudgeter.BudgetTrace t = budgeted.trace();
-            log.warn("[ReasoningNode] Loop budget trim: {} -> {} msgs (history {} -> {} tokens, "
-                    + "prefix~{}), head={}, tail={}, droppedMiddle={}, orphans={}, "
-                    + "anchorEnforced={}, anchorStitched={}, targetMaxTripped={}, "
-                    + "capExceededForPairIntegrity={}, minTailFloorApplied={}, conv={}",
-                    t.originalCount(), t.finalCount(), t.originalTokens(), t.finalTokens(),
-                    t.reservedPrefixTokens(),
-                    t.headKept(), t.tailKept(), t.droppedMiddle(), t.orphansRemoved(),
-                    t.anchorEnforced(), t.anchorStitched(), t.targetMaxTripped(),
-                    t.capExceededForPairIntegrity(), t.minTailFloorApplied(), conversationId);
-        }
-        messages = budgeted.messages();
 
         String workspaceBasePath = state.value(vip.mate.agent.graph.state.MateClawStateKeys.WORKSPACE_BASE_PATH, "");
         String agentIdStr = state.value(MateClawStateKeys.AGENT_ID, "");
@@ -885,7 +836,8 @@ public class ReasoningNode implements NodeAction {
             try {
                 vip.mate.agent.progress.ProgressLedger ledger =
                         progressLedgerService.load(conversationId);
-                String snapshot = ledger.renderSnapshot();
+                String snapshot = prefixBudgetPlan != null && prefixBudgetPlan.enabled()
+                        ? ledger.renderSnapshot(prefixBudgetPlan.ledgerTokens()) : ledger.renderSnapshot();
                 if (snapshot != null) {
                     nonHistoryPrefix.add(new SystemMessage(snapshot));
                 }
@@ -965,8 +917,6 @@ public class ReasoningNode implements NodeAction {
             messages = conversationWindowManager.pruneOldToolResultsForModelInput(
                     messages, conversationId, receiptWorkspace);
         }
-        List<Message> promptMessages = new ArrayList<>(nonHistoryPrefix);
-        promptMessages.addAll(messages);
 
         // 请求级思考深度覆盖（ThinkingLevelHolder 由 AgentService 设置）
         String effectiveReasoning = resolveEffectiveReasoningEffort();
@@ -984,6 +934,39 @@ public class ReasoningNode implements NodeAction {
         activeCallbacks = filterLongFormArtifactTools(accessor.userMessage(), activeCallbacks);
 
         ChatOptions options = buildChatOptions(effectiveReasoning, activeCallbacks);
+        int outputReserveTokens = outputReserveTokens(options, effectiveMaxOutputTokens());
+
+        // Reserve exactly the prefix and schemas assembled for this call, plus actual output once.
+        int loopReservedPrefixTokens = TokenEstimator.estimateTokens(nonHistoryPrefix)
+                + TokenEstimator.estimateToolsTokens(activeCallbacks) + outputReserveTokens;
+        LoopBudgetConfig loopCfg = LoopBudgetConfig.forContext(loopContextWindowTokens())
+                .withReservedPrefixTokens(loopReservedPrefixTokens);
+        // Leave room for the protected history head and latest user anchor.
+        // Ordinary history is clipped below the default policy floor when
+        // needed. An indivisible latest tool pair is checked before sending.
+        int protectedHistoryTokens = protectedHistoryTokens(messages);
+        int availableHistoryTokens = Math.max(0,
+                loopContextWindowTokens() - loopReservedPrefixTokens - protectedHistoryTokens);
+        loopCfg = loopCfg.withAvailableHistoryTokens(availableHistoryTokens);
+        LoopMessageBudgeter.Result budgeted = LOOP_BUDGETER.budget(messages, loopCfg);
+        // Only log when the budget actually modified the list — a triggered-
+        // but-no-op pass is normal (history fits comfortably under the tail
+        // budget) and would otherwise spam logs every iteration.
+        if (budgeted.trace().modified()) {
+            LoopMessageBudgeter.BudgetTrace t = budgeted.trace();
+            log.warn("[ReasoningNode] Loop budget trim: {} -> {} msgs (history {} -> {} tokens, "
+                    + "prefix~{}), head={}, tail={}, droppedMiddle={}, orphans={}, "
+                    + "anchorEnforced={}, anchorStitched={}, targetMaxTripped={}, "
+                    + "capExceededForPairIntegrity={}, minTailFloorApplied={}, conv={}",
+                    t.originalCount(), t.finalCount(), t.originalTokens(), t.finalTokens(),
+                    t.reservedPrefixTokens(),
+                    t.headKept(), t.tailKept(), t.droppedMiddle(), t.orphansRemoved(),
+                    t.anchorEnforced(), t.anchorStitched(), t.targetMaxTripped(),
+                    t.capExceededForPairIntegrity(), t.minTailFloorApplied(), conversationId);
+        }
+        messages = budgeted.messages();
+        List<Message> promptMessages = new ArrayList<>(nonHistoryPrefix);
+        promptMessages.addAll(messages);
 
         Prompt prompt = new Prompt(promptMessages, options);
 
@@ -1000,19 +983,23 @@ public class ReasoningNode implements NodeAction {
                     conversationId, loopContextWindowTokens(), prefixEstimateTokens,
                     toolSchemaEstimateTokens, TokenEstimator.estimateTokens(messages));
         }
-        // The prefix cannot be compacted (history compaction is the only lever),
-        // so a prefix that alone exceeds the window makes the request doomed —
-        // fail fast with the same PROMPT_TOO_LONG shape a provider rejection
-        // would produce instead of sending it. Gated on budgeting being active
-        // (an estimation false-positive must not block requests otherwise).
-        boolean prefixOverflow = prefixBudgetPlan != null && prefixBudgetPlan.enabled()
-                && prefixEstimateTokens + toolSchemaEstimateTokens > prefixBudgetPlan.effectiveMaxTokens();
+        // Check the complete assembled request, including indivisible latest
+        // tool pairs which can exceed a tail allowance. Reject known estimated
+        // overflow before the provider or a futile compaction retry. Disabled
+        // budgeting retains legacy behavior.
+        boolean mandatoryPrefixOverflow = loopReservedPrefixTokens + protectedHistoryTokens
+                > loopContextWindowTokens();
+        int assembledPromptEstimateTokens = TokenEstimator.estimateTokens(promptMessages)
+                + toolSchemaEstimateTokens + outputReserveTokens;
+        boolean promptOverflow = prefixBudgetPlan != null && prefixBudgetPlan.enabled()
+                && assembledPromptEstimateTokens > prefixBudgetPlan.effectiveMaxTokens();
+        boolean localPromptRejected = promptOverflow;
 
         // ======= LLM 调用区域 =======
         // nextLlmCallCount 在首次 streamCall 之前计算。
         // 所有退出路径（正常、stopped、fatal error、CancellationException）都必须写回此值。
         // PTL compact retry 会再 +1。
-        int nextLlmCallCount = accessor.llmCallCount() + 1;
+        int nextLlmCallCount = accessor.llmCallCount();
         log.debug("[ReasoningNode] Calling LLM with {} messages, {} tool definitions, iteration {}/{}, llmCallCount={}",
                 promptMessages.size(), activeCallbacks.size(),
                 accessor.iterationCount(), accessor.maxIterations(), nextLlmCallCount);
@@ -1035,26 +1022,35 @@ public class ReasoningNode implements NodeAction {
                 "llmCallCount", nextLlmCallCount
         ));
 
-        NodeStreamingChatHelper.StreamResult result;
+        NodeStreamingChatHelper.StreamResult result = null;
         try {
-            if (prefixOverflow) {
-                String overflowMessage = "Prompt 前缀估算 " + (prefixEstimateTokens + toolSchemaEstimateTokens)
+            if (promptOverflow) {
+                String overflowMessage = (mandatoryPrefixOverflow
+                        ? "受保护前缀/原始目标无法容纳" : "不可拆分的当前历史/工具对无法容纳")
+                        + ": Prompt 估算 " + assembledPromptEstimateTokens
                         + " tokens(注入块 " + prefixEstimateTokens + " + 工具 schema " + toolSchemaEstimateTokens
-                        + ")已超过模型上下文窗口 " + prefixBudgetPlan.effectiveMaxTokens()
-                        + " tokens,历史压缩无法解决——请精简 Agent 身份 prompt、减少绑定工具/技能,"
-                        + "或换用更大窗口的模型";
+                        + " + 历史 " + TokenEstimator.estimateTokens(messages)
+                        + " + 输出预留 " + outputReserveTokens + ")超过模型上下文窗口 "
+                        + prefixBudgetPlan.effectiveMaxTokens()
+                        + " tokens；已保留原始目标与完整工具对，无法安全继续压缩，请使用更大窗口或缩短必需上下文。";
                 log.error("[ReasoningNode] {}", overflowMessage);
                 result = new NodeStreamingChatHelper.StreamResult(null, null, null, List.of(), false,
                         0, 0, false, overflowMessage,
                         NodeStreamingChatHelper.ErrorType.PROMPT_TOO_LONG, false, 0, 0, 0);
             } else {
+                nextLlmCallCount++;
                 result = streamingHelper.streamCall(chatModel, prompt, conversationId, "reasoning");
             }
 
             // PTL 处理：结构化压缩后重试。复用 nonHistoryPrefix 保证重试
             // Prompt 仍带 wiki / runtime context；早期的 tail-only 路径会把
             // wiki 段一起丢掉，重试后的 prompt 比原始更短少一层信息。
-            if (result.isPromptTooLong() && conversationWindowManager != null) {
+            if (!promptOverflow && result.isPromptTooLong() && conversationWindowManager != null) {
+                // Structured compaction can itself invoke the model. Keep one
+                // slot for the actual retry and do not start with just one left.
+                if (!hasLlmCallBudget(accessor.maxIterations(), nextLlmCallCount, 2)) {
+                    return retryBudgetStop(state, nextLlmCallCount, result);
+                }
                 log.warn("[ReasoningNode] Prompt too long, attempting STRUCTURED compaction and retry");
 
                 // MateClawStateAccessor.agentId() returns String per state
@@ -1069,23 +1065,68 @@ public class ReasoningNode implements NodeAction {
                     }
                 }
 
-                List<Message> compactedMessages = conversationWindowManager.compactForRetry(
-                        messages, chatModel, conversationId, agentIdLong);
+                BudgetedCompactionModel compactionModel = new BudgetedCompactionModel(chatModel,
+                        remainingLlmCalls(accessor.maxIterations(), nextLlmCallCount) - 1,
+                        prefixBudgetPlan != null && prefixBudgetPlan.enabled() ? loopContextWindowTokens() : 0,
+                        outputReserveTokens);
+                List<Message> compactedMessages;
+                try {
+                    compactedMessages = conversationWindowManager.compactForRetry(
+                            messages, compactionModel, conversationId, agentIdLong);
+                } catch (CallBudgetExceeded exhausted) {
+                    return retryBudgetStop(compactionModel.withUsage(state), nextLlmCallCount + compactionModel.calls(), result);
+                } catch (SummaryPromptOverflow oversized) {
+                    compactedMessages = null;
+                } finally {
+                    nextLlmCallCount += compactionModel.calls();
+                    state = compactionModel.withUsage(state);
+                }
+                if (compactionModel.cancellation() != null) throw compactionModel.cancellation();
+                if (compactionModel.blockedPrompt() != null) {
+                    localPromptRejected = true;
+                    result = new NodeStreamingChatHelper.StreamResult(null, null, null, List.of(), false,
+                            0, 0, false, compactionModel.blockedPrompt(),
+                            NodeStreamingChatHelper.ErrorType.PROMPT_TOO_LONG, false, 0, 0, 0);
+                    compactedMessages = null;
+                }
+                if (compactedMessages != null) {
+                    compactedMessages = restoreOriginalAnchor(compactedMessages, latestUser(messages));
+                }
 
                 if (compactedMessages != null && compactedMessages.size() < messages.size()) {
                     // Reuse the SAME non-history prefix — wiki/runtime context preserved.
                     List<Message> retryPromptMessages = new ArrayList<>(nonHistoryPrefix);
                     retryPromptMessages.addAll(compactedMessages);
-                    Prompt retryPrompt = new Prompt(retryPromptMessages, options);
-                    log.info("[ReasoningNode] Retrying with compacted messages: {} -> {} messages",
-                            messages.size(), compactedMessages.size());
-                    nextLlmCallCount++;
-                    pushPhase(conversationId, "reasoning", Map.of(
-                            "iteration", accessor.iterationCount(),
-                            "llmCallCount", nextLlmCallCount,
-                            "compacted", true
-                    ));
-                    result = streamingHelper.streamCall(chatModel, retryPrompt, conversationId, "reasoning_compact_retry");
+                    int retryEstimateTokens = TokenEstimator.estimateTokens(retryPromptMessages)
+                            + toolSchemaEstimateTokens + outputReserveTokens;
+                    if (prefixBudgetPlan != null && prefixBudgetPlan.enabled()
+                            && retryEstimateTokens > prefixBudgetPlan.effectiveMaxTokens()) {
+                        localPromptRejected = true;
+                        String retryOverflowMessage = "压缩重试 Prompt 估算 " + retryEstimateTokens
+                                + " tokens 仍超过上下文窗口 " + prefixBudgetPlan.effectiveMaxTokens()
+                                + " tokens，保留完整前缀与必需历史后无法安全重试。";
+                        log.error("[ReasoningNode] {}", retryOverflowMessage);
+                        result = new NodeStreamingChatHelper.StreamResult(null, null, null, List.of(), false,
+                                0, 0, false, retryOverflowMessage,
+                                NodeStreamingChatHelper.ErrorType.PROMPT_TOO_LONG, false, 0, 0, 0);
+                    } else {
+                        Prompt retryPrompt = new Prompt(retryPromptMessages, options);
+                        log.info("[ReasoningNode] Retrying with compacted messages: {} -> {} messages",
+                                messages.size(), compactedMessages.size());
+                        nextLlmCallCount++;
+                        pushPhase(conversationId, "reasoning", Map.of(
+                                "iteration", accessor.iterationCount(),
+                                "llmCallCount", nextLlmCallCount,
+                                "compacted", true
+                        ));
+                        if (!hasLlmCallBudget(accessor.maxIterations(), nextLlmCallCount - 1, 1)) {
+                            return retryBudgetStop(state, nextLlmCallCount - 1, result);
+                        }
+                        result = streamingHelper.streamCall(chatModel, retryPrompt, conversationId, "reasoning_compact_retry");
+                        // Later nudges must use the history actually sent here.
+                        messages = compactedMessages;
+                        promptMessages = retryPromptMessages;
+                    }
                 } else {
                     log.warn("[ReasoningNode] Compaction did not reduce messages, cannot retry");
                 }
@@ -1113,6 +1154,9 @@ public class ReasoningNode implements NodeAction {
             for (ContinuationIntent intent = classifyContinuation(result);
                     emptyRetries < MAX_EMPTY_COMPLETION_RETRIES && intent != ContinuationIntent.FINAL;
                     intent = classifyContinuation(result)) {
+                if (!hasLlmCallBudget(accessor.maxIterations(), nextLlmCallCount, 1)) {
+                    return retryBudgetStop(state, nextLlmCallCount, result);
+                }
                 emptyRetries++;
                 boolean afterTool = lastTurnIsToolResponse(promptMessages);
                 String nudge = afterTool
@@ -1123,12 +1167,36 @@ public class ReasoningNode implements NodeAction {
                 log.warn("[ReasoningNode] {} completion (afterTool={}); nudging to continue "
                                 + "(retry {}/{}), conv={}",
                         intent, afterTool, emptyRetries, MAX_EMPTY_COMPLETION_RETRIES, conversationId);
-                List<Message> nudgedMessages = new ArrayList<>(promptMessages);
-                nudgedMessages.add(new UserMessage(nudge));
+                // Runtime instructions belong in the prefix, not a new user
+                // objective which would replace the protected original anchor.
+                List<Message> nudgePrefix = new ArrayList<>(nonHistoryPrefix);
+                nudgePrefix.add(new SystemMessage(nudge));
+                int nudgeReserved = TokenEstimator.estimateTokens(nudgePrefix)
+                        + toolSchemaEstimateTokens + outputReserveTokens;
+                LoopBudgetConfig nudgeConfig = LoopBudgetConfig.forContext(loopContextWindowTokens())
+                        .withReservedPrefixTokens(nudgeReserved)
+                        .withAvailableHistoryTokens(Math.max(0, loopContextWindowTokens()
+                                - nudgeReserved - protectedHistoryTokens(messages)));
+                List<Message> nudgeHistory = LOOP_BUDGETER.budget(messages, nudgeConfig).messages();
+                List<Message> nudgedMessages = new ArrayList<>(nudgePrefix);
+                nudgedMessages.addAll(nudgeHistory);
+                int nudgeEstimate = TokenEstimator.estimateTokens(nudgedMessages)
+                        + toolSchemaEstimateTokens + outputReserveTokens;
+                if (prefixBudgetPlan != null && prefixBudgetPlan.enabled()
+                        && nudgeEstimate > prefixBudgetPlan.effectiveMaxTokens()) {
+                    localPromptRejected = true;
+                    result = new NodeStreamingChatHelper.StreamResult(null, null, null, List.of(), false,
+                            0, 0, false, "空回复重试 Prompt 估算 " + nudgeEstimate
+                                    + " tokens 超过上下文窗口，无法保留完整前缀、原始目标与工具对。",
+                            NodeStreamingChatHelper.ErrorType.PROMPT_TOO_LONG, false, 0, 0, 0);
+                    break;
+                }
                 Prompt nudgePrompt = new Prompt(nudgedMessages, options);
                 nextLlmCallCount++;
                 result = streamingHelper.streamCall(
                         chatModel, nudgePrompt, conversationId, "reasoning_empty_retry");
+                messages = nudgeHistory;
+                promptMessages = nudgedMessages;
             }
         } catch (CancellationException ce) {
             // "调用已发出但尚未产出内容时用户停止" — streamHelper 抛 CancellationException。
@@ -1141,6 +1209,8 @@ public class ReasoningNode implements NodeAction {
                     .needsToolCall(false)
                     .shouldSummarize(false)
                     .llmCallCount(nextLlmCallCount)
+                    .mergeUsage(state, result != null ? result : new NodeStreamingChatHelper.StreamResult(
+                            "", "", null, List.of(), false, 0, 0))
                     .finishReason(FinishReason.STOPPED)
                     .contentStreamed(true)
                     .thinkingStreamed(true)
@@ -1254,8 +1324,8 @@ public class ReasoningNode implements NodeAction {
                     .finalAnswer("[错误] " + result.errorMessage())
                     .llmCallCount(nextLlmCallCount)
                     .finishReason(FinishReason.ERROR_FALLBACK)
-                    .contentStreamed(true)
-                    .thinkingStreamed(true)
+                    .contentStreamed(!localPromptRejected)
+                    .thinkingStreamed(!localPromptRejected || accessor.thinkingStreamed())
                     .mergeUsage(state, result)
                     .build();
         }
@@ -1475,6 +1545,57 @@ public class ReasoningNode implements NodeAction {
         return "\n\n[证据不足] 以下引用未出现在本轮已读取/搜索到的工具证据中，或缺少有效来源标注："
                 + String.join(", ", unsupportedReferences)
                 + "。请继续检索/读取相关证据后再下结论。";
+    }
+
+    static boolean hasLlmCallBudget(int maxIterations, long usedCalls, long neededCalls) {
+        return maxIterations <= 0 || (long)maxIterations * 5L - usedCalls >= neededCalls;
+    }
+
+    private static long remainingLlmCalls(int maxIterations, long usedCalls) {
+        return maxIterations <= 0 ? Long.MAX_VALUE : Math.max(0, (long)maxIterations * 5L - usedCalls);
+    }
+
+    private static UserMessage latestUser(List<Message> messages) {
+        for (int i=messages.size()-1;i>=0;i--) if (messages.get(i) instanceof UserMessage user) return user;
+        return null;
+    }
+
+    private static int protectedHistoryTokens(List<Message> messages) {
+        int tokens=0;
+        for (Message message:messages) {
+            if (!(message instanceof SystemMessage)) break;
+            tokens += TokenEstimator.estimateTokens(message);
+        }
+        return tokens + TokenEstimator.estimateTokens(latestUser(messages));
+    }
+
+    private static List<Message> restoreOriginalAnchor(List<Message> compacted, UserMessage original) {
+        if (original == null || compacted.stream().anyMatch(message -> message instanceof UserMessage
+                && message.getText().equals(original.getText()))) return compacted;
+        List<Message> restored = new ArrayList<>(compacted);
+        int insertion=0;
+        for (int i=0;i<restored.size();i++) if (restored.get(i) instanceof UserMessage) insertion=i+1;
+        while (insertion<restored.size() && restored.get(insertion) instanceof SystemMessage) insertion++;
+        restored.add(insertion,original);
+        return restored;
+    }
+
+    private static Map<String,Object> retryBudgetStop(RunState state, int calls,
+                                                       NodeStreamingChatHelper.StreamResult result) {
+        var output=reasonOutput().needsToolCall(false).shouldSummarize(false).continueReasoning(false)
+                .finalAnswer("（本轮模型调用预算已用尽或不足以安全重试，任务尚未完成。）")
+                .llmCallCount(calls).finishReason(FinishReason.INCOMPLETE)
+                .contentStreamed(false).thinkingStreamed(new MateClawStateAccessor(state).thinkingStreamed()
+                        || result != null && result.thinking() != null && !result.thinking().isBlank());
+        if (result != null) {
+            output.mergeUsage(state,result);
+            if (result.thinking() != null && !result.thinking().isBlank()) output.finalThinking(result.thinking());
+        }
+        return output.build();
+    }
+
+    static int outputReserveTokens(ChatOptions options, int fallback) {
+        return BudgetedCompactionModel.outputReserveTokens(options,fallback);
     }
 
     private AssistantMessage.ToolCall deserializeToolCall(String json) {

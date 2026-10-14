@@ -635,6 +635,7 @@ public class AgentGraphBuilder {
                 runtimeModel, agentId, skillCatalogRenderer, prefixBudgetPlan, autoDemotedTools);
         StateGraphReActAgent agent = new StateGraphReActAgent(chatClient, conversationService, compiledGraph,
                 chatModel, conversationWindowManager, toolSet);
+        agent.setPrefixBudgetPlan(prefixBudgetPlan);
         if (reasoningRetentionProperties != null) {
             agent.setPersistEveryIterationReasoning(reasoningRetentionProperties.persistsEveryIteration());
         }
@@ -928,6 +929,7 @@ public class AgentGraphBuilder {
             SummarizingNode summarizingNode = new SummarizingNode(chatModel, streamingHelper, streamTracker);
             LimitExceededNode limitExceededNode = new LimitExceededNode(
                     chatModel, observationProcessor, streamingHelper, i18nService, progressLedgerService);
+            limitExceededNode.setPrefixBudgetPlan(prefixBudgetPlan);
             FinalAnswerNode finalAnswerNode = new FinalAnswerNode(generatedFileCache, markdownNormalizeEnabled);
 
 
@@ -1512,9 +1514,9 @@ public class AgentGraphBuilder {
                 If you try to read a PDF/Office file with read_file, you will get binary garbage or an error.
 
                 ## ProgressLedger Discipline (mandatory)
-                The `## 当前任务进度` block injected near the top of every turn is the **authoritative record** of what you have done and what remains. Treat it as ground truth, not as a scratchpad you may ignore.
+                The `## 当前任务进度` block injected near the top of every turn preserves recorded step statuses across context trims. Model-authored `done` entries are progress claims, not proof of successful execution or acceptance; check actual results before claiming completion.
                 - **On starting any multi-step task** (≥3 tool calls expected), call `progress_update` in parallel batches of at most 16 calls to register every pending step BEFORE doing the work. Split larger ledgers across turns so the executor cap never drops entries.
-                - **After each completed sub-step**, immediately call `progress_update` to flip its status to `done`. "Immediately" means in the same tool_calls batch that returns the result, not after the next reasoning turn.
+                - **After receiving and verifying a successful sub-step result**, call `progress_update` to flip that step to `done` on your next action. Never mark an operation `done` in the batch that starts it. You may batch the previous step's `done` update with the next independent step's tool call; each computation must still have its own tool call. Progress registration batches do not merge computational stages.
                 - **Never re-execute a step the ledger shows as `done`** unless you can articulate why the prior result is stale.
                 - **🔒 固定约束 entries** (pinned from skill manifests) are non-negotiable. They survive context compression for a reason — re-read them every turn and make sure your planned action still satisfies them.
                 - **🔧 自动记录 entries** are auto-filled by Java after each tool call. They are a safety net, not a substitute for your own `progress_update` — if you only rely on them, you will lose the pending/blocked view that drives planning.

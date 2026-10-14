@@ -19,9 +19,8 @@ package vip.mate.agent.context;
  *   <li>{@code keepTailTokens} — token budget reserved for the tail (recent
  *       observations + the current user message). Scales with the model
  *       window instead of relying on a fixed count.</li>
- *   <li>{@code minTailMessages} — floor on the kept-tail count. Prevents a
- *       single huge tool output from collapsing the tail to one message and
- *       losing recent reasoning context.</li>
+ *   <li>{@code minTailMessages} — preferred floor on the kept-tail count,
+ *       applied only when those messages fit the tail soft ceiling.</li>
  *   <li>{@code tailSoftCeilingRatio} — multiplier applied to
  *       {@code keepTailTokens} when honoring the floor or pulling back to
  *       keep a tool pair whole. Lets the tail overshoot the hard budget by
@@ -48,8 +47,11 @@ public record LoopBudgetConfig(
     /** Smallest useful trigger threshold; below this budgeting is effectively disabled. */
     public static final int MIN_TRIGGER_TOKENS = 1_000;
 
-    /** Smallest sensible tail budget; below this even one observation may not fit. */
-    public static final int MIN_TAIL_TOKENS = 2_000;
+    /** Smallest representable explicit remaining-history budget. */
+    public static final int MIN_TAIL_TOKENS = 1;
+
+    /** Default policy floor; explicit available-window clipping may go lower. */
+    public static final int DEFAULT_MIN_TAIL_TOKENS = 2_000;
 
     /** Floor on minTailMessages — fewer than 3 collapses recent context too aggressively. */
     public static final int MIN_TAIL_MESSAGES_FLOOR = 3;
@@ -109,8 +111,8 @@ public record LoopBudgetConfig(
      *   <li>trigger = 50% of the window — same threshold the multi-turn
      *       compressor uses, so the two layers stay calibrated.</li>
      *   <li>tail budget = 30% of the window.</li>
-     *   <li>minTailMessages = 4 — at least one full reasoning/action cycle
-     *       stays visible to the LLM no matter how big a single tool output is.</li>
+     *   <li>minTailMessages = 4 — prefer a full recent reasoning/action cycle
+     *       when it fits. Indivisible tool pairs are protected separately.</li>
      *   <li>tailSoftCeilingRatio = 1.5 — let the tail overshoot by 50% when
      *       enforcing the floor or pulling back to keep a tool pair whole.</li>
      *   <li>reservedPrefixTokens = 0 — caller should override with the real
@@ -124,12 +126,29 @@ public record LoopBudgetConfig(
         if (contextWindowTokens <= 0) {
             contextWindowTokens = 32_000;
         }
-        int trigger = Math.max(MIN_TRIGGER_TOKENS, (int) (contextWindowTokens * 0.50));
-        int tail = Math.max(MIN_TAIL_TOKENS, (int) (contextWindowTokens * 0.30));
+        // Tiny reported windows still need a valid policy configuration so callers
+        // can reject an impossible protected prefix rather than fail in this constructor.
+        int trigger = Math.max(DEFAULT_MIN_TAIL_TOKENS + MIN_TRIGGER_TOKENS,
+                (int) (contextWindowTokens * 0.50));
+        int tail = Math.max(DEFAULT_MIN_TAIL_TOKENS, (int) (contextWindowTokens * 0.30));
         if (tail >= trigger) {
-            tail = Math.max(MIN_TAIL_TOKENS, trigger - MIN_TRIGGER_TOKENS);
+            tail = Math.max(DEFAULT_MIN_TAIL_TOKENS, trigger - MIN_TRIGGER_TOKENS);
         }
         return new LoopBudgetConfig(trigger, tail, 4, 1.5, 0, 200);
+    }
+
+    /**
+     * Clip the recent-history policy to the actual remaining window. The
+     * default 2000-token policy floor is not a permission to overflow it.
+     * An indivisible latest tool pair may still exceed this estimate; callers
+     * must reject that assembled prompt before contacting the provider.
+     */
+    public LoopBudgetConfig withAvailableHistoryTokens(int availableTokens) {
+        int tail = Math.min(keepTailTokens, Math.max(MIN_TAIL_TOKENS, availableTokens));
+        double ratio = Math.min(tailSoftCeilingRatio,
+                Math.max(1.0, (double)availableTokens / tail));
+        return new LoopBudgetConfig(triggerTokens, tail, minTailMessages,
+                ratio, reservedPrefixTokens, targetMaxMessages);
     }
 
     /** Return a copy with {@code reservedPrefixTokens} replaced. */

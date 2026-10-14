@@ -23,6 +23,32 @@ class ReasoningDispatcherLlmCallCountTest {
         dispatcher = new ReasoningDispatcher();
     }
 
+    @Test
+    void completionRetryCannotBypassFiniteCallCeiling() throws Exception {
+        for (int calls : new int[]{50, 51}) {
+            assertEquals(LIMIT_EXCEEDED_NODE, dispatcher.apply(new RunState(Map.of(
+                    CURRENT_ITERATION, 1, MAX_ITERATIONS, 10,
+                    LLM_CALL_COUNT, calls, CONTINUE_REASONING, true))));
+        }
+    }
+
+    @Test
+    void completionRetryBelowCeilingAndUnlimitedRemainRunnable() throws Exception {
+        assertEquals(REASONING_NODE, dispatcher.apply(new RunState(Map.of(
+                CURRENT_ITERATION, 1, MAX_ITERATIONS, 10,
+                LLM_CALL_COUNT, 49, CONTINUE_REASONING, true))));
+        assertEquals(REASONING_NODE, dispatcher.apply(new RunState(Map.of(
+                CURRENT_ITERATION, 1, MAX_ITERATIONS, 0,
+                LLM_CALL_COUNT, Integer.MAX_VALUE, CONTINUE_REASONING, true))));
+    }
+
+    @Test
+    void largePositiveIterationBudgetDoesNotOverflowCallCeiling() throws Exception {
+        assertEquals(ACTION_NODE, dispatcher.apply(new RunState(Map.of(
+                CURRENT_ITERATION, 1, MAX_ITERATIONS, 500_000_000,
+                LLM_CALL_COUNT, 1, NEEDS_TOOL_CALL, true))));
+    }
+
     // ===== LLM 调用计数 =====
 
     @Nested

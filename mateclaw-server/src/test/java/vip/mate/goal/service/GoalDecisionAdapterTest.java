@@ -27,7 +27,7 @@ class GoalDecisionAdapterTest {
     GoalEntity goal() {
         var g = new GoalEntity(); g.setId(1L); g.setWorkspaceId(3L); g.setConversationId("conversation");
         g.setStatus(GoalStatus.ACTIVE); g.setAutoFollowupEnabled(true); g.setPersistentExecution(true);
-        g.setTurnBudget(0); g.setLlmCallBudget(0); g.setTitle("objective"); return g;
+        g.setFollowupCooldownSeconds(0); g.setTurnBudget(0); g.setLlmCallBudget(0); g.setTitle("objective"); return g;
     }
     GoalEvaluationResult evaluation() {
         return new GoalEvaluationResult(0, "remaining", "continue", false, "", 0, 0, List.of(), null);
@@ -176,6 +176,89 @@ class GoalDecisionAdapterTest {
                     }
                 }
             }
+        }
+    }
+
+    @Test void versionedFactsAreBoundedPrivateAndSnapshotActualEvaluation() {
+        var g = goal(); g.setCriteria("[{\"id\":\"C1\",\"text\":\"private objective\",\"passed\":true,\"evidence\":\"private evidence\"}]");
+        g.setAgentLlmCallsUsed(Integer.MAX_VALUE); g.setEvalLlmCallsUsed(Integer.MAX_VALUE);
+        g.setEvaluationRevision(4);
+        when(decisions.decide(any())).thenAnswer(i -> {
+            DecisionRequest r = i.getArgument(0);
+            assertEquals("goal-continuation-v2", r.question().version());
+            assertEquals(4294967294d, r.facts().numbers().get("LLM_CALLS_USED"));
+            assertEquals(1d, r.facts().numbers().get("VERIFIED_CRITERIA_COUNT"));
+            assertTrue(r.facts().flags().get("EVALUATION_STALE"));
+            assertFalse(r.facts().toString().contains("private"));
+            return new DecisionTicket(null, DecisionMode.OFF, r.baseline());
+        });
+        adapter.select(g,
+                new GoalEvaluationResult(0, "private gap", "continue", false, "private model", 1, 0, List.of(), null, 3), now, null, "GRAPH");
+    }
+
+    @Test void rulePipelineValidatesCurrentFactsAndRetriesOnlyActualStaleEvaluations() {
+        var config = new DecisionProperties(); config.setMode(DecisionMode.ACTIVE); config.setProvider("rule");
+        try (var service = new DecisionService(config, List.of(new RuleDecisionProvider()), mock(DecisionRecordStore.class), new SimpleMeterRegistry())) {
+            var actual = new GoalDecisionAdapter(baseline, service);
+            var g = goal(); g.setCriteria("[]"); g.setTurnsUsed(0); g.setAgentLlmCallsUsed(0); g.setEvalLlmCallsUsed(0); g.setEvaluationRevision(2);
+            var stale = new GoalEvaluationResult(0, "gap", "continue", false, "model", 1, 0, List.of(), null, 1);
+            assertEquals(GoalContinuationDecision.Action.RETRY, actual.select(g, stale, now, null, "GRAPH").decision().action());
+            assertEquals(GoalContinuationDecision.Action.CONTINUE, actual.select(g, evaluation(), now, null, "GRAPH").decision().action());
+            assertEquals(GoalContinuationDecision.Action.CONTINUE, actual.select(g, stale.withEvaluationRevision(2), now, null, "GRAPH").decision().action());
+            g.setTurnBudget(1); g.setTurnsUsed(1);
+            assertEquals(GoalContinuationDecision.Action.BUDGET_LIMITED, actual.select(g, stale, now, null, "GRAPH").decision().action());
+        }
+    }
+
+    @Test void realRuleRecordsOnlySchedulingMetadataAcrossModesAndKeepsShadowBaseline() throws Exception {
+        for (DecisionMode mode : DecisionMode.values()) {
+            var config = new DecisionProperties(); config.setMode(mode); config.setProvider("rule");
+            var records = mock(DecisionRecordStore.class);
+            var inserted = new java.util.concurrent.CopyOnWriteArrayList<vip.mate.decision.record.DecisionRecord>();
+            var latch = new CountDownLatch(1);
+            doAnswer(i -> { inserted.add(i.getArgument(0)); latch.countDown(); return null; }).when(records).insert(any());
+            try (var service = new DecisionService(config, List.of(new RuleDecisionProvider()), records, new SimpleMeterRegistry())) {
+                var actual = new GoalDecisionAdapter(baseline, service);
+                var g = goal(); g.setCriteria("[]"); g.setTurnsUsed(0); g.setAgentLlmCallsUsed(0); g.setEvalLlmCallsUsed(0); g.setEvaluationRevision(2);
+                var stale = new GoalEvaluationResult(0, "private gap", "continue", false, "private model", 1, 0, List.of(), null, 1);
+                var selected = actual.selectGraph(g, Optional.of("private prompt"), now, false, stale);
+                assertEquals(mode == DecisionMode.ACTIVE ? GoalContinuationDecision.Action.RETRY : GoalContinuationDecision.Action.CONTINUE,
+                        selected.decision().action());
+                assertEquals("private prompt", selected.decision().prompt());
+                if (mode == DecisionMode.OFF) { verifyNoInteractions(records); continue; }
+                assertTrue(latch.await(5, TimeUnit.SECONDS));
+                var record = inserted.getFirst();
+                assertEquals("goal-continuation-v2", record.questionVersion());
+                assertEquals("CONTINUE", record.baseline()); assertEquals("RETRY", record.proposed());
+                assertEquals("PROPOSED", record.reason()); assertEquals(1d, record.confidence());
+                assertFalse(record.toString().contains("private"));
+                actual.outcome(selected.ticket(), true, mode == DecisionMode.ACTIVE ? "GRAPH_SUPPRESSED" : "FOLLOWUP_SUBMITTED");
+                verify(records, timeout(5000)).outcome(eq(selected.ticket().id()),
+                        eq(mode == DecisionMode.SHADOW ? DecisionOutcome.OBSERVED : DecisionOutcome.APPLIED), any());
+            }
+        }
+    }
+
+    @Test void graphCooldownFactsValidateActualNowWithoutChangingOriginalPlanningSnapshot() {
+        var config = new DecisionProperties(); config.setMode(DecisionMode.ACTIVE); config.setProvider("rule");
+        var records = mock(DecisionRecordStore.class);
+        try (var service = new DecisionService(config, List.of(new RuleDecisionProvider()), records, new SimpleMeterRegistry())) {
+            var actual = new GoalDecisionAdapter(baseline, service);
+            var g = goal(); g.setCriteria("[]"); g.setTurnsUsed(0); g.setAgentLlmCallsUsed(0); g.setEvalLlmCallsUsed(0);
+            g.setFollowupCooldownSeconds(30); g.setLastFollowupAt(now); g.setEvaluationRevision(2);
+            var stale = new GoalEvaluationResult(0, "private", "continue", false, "model", 1, 0, List.of(), null, 1);
+            assertEquals(GoalContinuationDecision.Action.CONTINUE,
+                    actual.selectGraph(g, Optional.of("planned"), now.plusSeconds(29), false, stale).decision().action());
+            assertEquals(GoalContinuationDecision.Action.RETRY,
+                    actual.selectGraph(g, Optional.of("planned"), now.plusSeconds(30), false, stale).decision().action());
+            assertEquals(GoalContinuationDecision.Action.DISABLED,
+                    actual.selectGraph(g, Optional.empty(), now.plusSeconds(31), false, stale).decision().action());
+            var captor = org.mockito.ArgumentCaptor.forClass(vip.mate.decision.record.DecisionRecord.class);
+            verify(records, times(3)).insert(captor.capture());
+            assertEquals("BASELINE", captor.getAllValues().get(0).reason());
+            assertNull(captor.getAllValues().get(0).confidence());
+            assertEquals("PROPOSED", captor.getAllValues().get(1).reason());
+            assertEquals("GUARD", captor.getAllValues().get(2).reason());
         }
     }
 

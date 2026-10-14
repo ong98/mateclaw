@@ -672,7 +672,7 @@ public class AgentBindingService implements AgentBindingResolver {
             "getCurrentDate", "getCurrentDateTime", "getCurrentTime",
             "setGoal", "addGoalCriterion", "completeGoal", "getGoalStatus",
             "getManagedGoalJsonSlots", "publishManagedGoalJson", "checkManagedGoalJson",
-            "waitForGoalInput", "resumeGoal", "progress_update",
+            "waitForGoalInput", "resumeGoal", "progress_update", "get_progress",
             // These bridges resolve targets against the same effective allowlist.
             "enable_tool", "tool_search", "tool_describe", "tool_call"
     );
@@ -755,7 +755,7 @@ public class AgentBindingService implements AgentBindingResolver {
             // tasks need it on every business agent, not just the planner,
             // since context-window trims can otherwise let an agent forget
             // what it has already produced and re-do work or stall.
-            "progress_update",
+            "progress_update", "get_progress",
             // Document / media generation — agent-wide capabilities, never
             // declared inside any skill manifest. Pre-Phase-2b these were
             // universally visible; the new gate silently strips them whenever

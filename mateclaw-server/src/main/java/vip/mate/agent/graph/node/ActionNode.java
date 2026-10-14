@@ -62,7 +62,7 @@ public class ActionNode implements NodeAction {
      * </ul>
      */
     private static final Set<String> AUTO_RECORD_SKIP = Set.of(
-            LOAD_SKILL_TOOL, ENABLE_TOOL, TOOL_SEARCH, TOOL_DESCRIBE, PROGRESS_UPDATE_TOOL,
+            LOAD_SKILL_TOOL, ENABLE_TOOL, TOOL_SEARCH, TOOL_DESCRIBE, PROGRESS_UPDATE_TOOL, "get_progress",
             "listAvailableSkills", "readSkillFile", "runSkillScript",
             // read-only / status-query tools
             "read_file", "web_search",

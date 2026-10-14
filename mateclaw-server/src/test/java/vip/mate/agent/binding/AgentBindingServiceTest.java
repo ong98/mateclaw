@@ -533,6 +533,7 @@ class AgentBindingServiceTest {
 
         Set<String> effective = bindingService.getEffectiveToolNames(agentId);
         assertNotNull(effective, "toolsDisabled=true 时绝不能返回 null（那会让全局默认工具又流回来）");
+        assertTrue(effective.contains("get_progress"), "own-conversation recovery stays reachable with tools disabled");
         assertTrue(effective.contains("record_lesson"), "system-level memory 工具必须保留");
         assertTrue(effective.containsAll(Set.of("getManagedGoalJsonSlots", "publishManagedGoalJson", "checkManagedGoalJson")),
                 "选中的 JSON 要求不能因业务技能绑定失去受管发布和检查入口");

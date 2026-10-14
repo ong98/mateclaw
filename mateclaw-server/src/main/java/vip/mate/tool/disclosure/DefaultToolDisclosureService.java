@@ -44,7 +44,7 @@ public class DefaultToolDisclosureService implements ToolDisclosureService {
      * tool nor load a skill). Progress tracking stays visible during long runs.
      */
     private static final Set<String> ALWAYS_CORE = Set.of(
-            "enable_tool", "load_skill", "tool_search", "tool_describe", "tool_call", "progress_update");
+            "enable_tool", "load_skill", "tool_search", "tool_describe", "tool_call", "progress_update", "get_progress");
 
     /**
      * Code-level extension defaults for builtin tools that may not yet have a

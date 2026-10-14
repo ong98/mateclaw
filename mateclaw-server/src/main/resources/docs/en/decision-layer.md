@@ -33,7 +33,7 @@ mate:
       AGENT_ROUTING: OFF
 ```
 
-Scenario settings override the global mode. To disable the layer completely, set the global mode to OFF and remove or disable scenario overrides. The built-in `rule` Provider explicitly returns the legacy judgment without inventing a confidence value. The `llm` Provider is an unavailable stub; this phase does not call a new model service.
+Scenario settings override the global mode. To disable the layer completely, set the global mode to OFF and remove or disable scenario overrides. The built-in `rule` Provider evaluates deterministic scheduling rules for supported Goal v2 inputs. Other requests return the baseline without a confidence value. The `llm` Provider remains an unavailable stub; these rules do not call a new model service.
 
 ## Processing
 
@@ -68,7 +68,7 @@ Micrometer metrics include `mate.decision.total`, `mate.decision.duration`, `mat
 
 Routing v2 records correlate by parent Agent, conversation and PLAN_STEP phase. Step index is transient and plan/subplan IDs are not persisted in the audit, so exact audit-to-subplan reconstruction is not available. Actual assignment outcomes still commit with plan insertion.
 
-Queries must be scoped to workspace and time range. No new public query API is provided. Agreement rates must be considered alongside dropped work, failures, and missing outcomes. Agreement from the Rule stub does not establish improved model quality.
+Queries must be scoped to workspace and time range. No new public query API is provided. Agreement rates must be considered alongside dropped work, failures, and missing outcomes. Agreement from the Rule provider does not establish improved model quality.
 
 ## Validation and future Providers
 
@@ -103,3 +103,34 @@ Routing v2 supplies the current step as transient evidence and eligible same-wor
 Limits: 2048 characters per step, 1024 per option description, and 8192 across step and option descriptions. Missing steps or excessive inputs guard the baseline instead of silently truncating meaning; stale candidates retain the existing LOCAL guard priority. Character limits are not tokenizer limits. Audit records contain typed results and question versions, never these transient texts. Future remote providers still require an outbound-data policy for transient inputs.
 
 This iteration adds no candidate retrieval, live tool capability verification or semantic model provider. Agreement under default SHADOW/Rule does not establish better accuracy or execution efficiency.
+
+## Goal facts and conservative scheduling (third iteration)
+
+`GoalDecisionFacts` snapshots immutable `goal-continuation-v2` inputs at submission. Boolean and numeric facts cover Goal status, automatic followups, persistence, turns, business and evaluator model calls, finite or unlimited budgets, criterion counts, and passed criteria with evidence. Call totals use long arithmetic so int overflow cannot invalidate a budget. Goal, criterion, and evidence text are excluded from the snapshot and decision audit.
+
+Criterion JSON must satisfy a field whitelist, unique IDs, and type checks. Duplicate JSON fields, trailing content, inputs over 65536 characters or 1000 criteria, and other malformed inputs are marked invalid. An actual evaluation requires a nonblank evaluator model and positive call usage; score, decision/completed consistency, and revision are validated. A valid synthetic CONTINUE with no model and zero calls is scheduling input, not a fresh acceptance verdict. Partial provenance is invalid. Full revision comparisons distinguish current from stale evaluations.
+
+Cooldown facts use the same scheduling time supplied by the adapter. With a known nonnegative configuration, the last followup determines active/ready; readiness includes the exact deadline. Missing configuration/time or date overflow remains unknown and falls back to the baseline. The compatible two-argument snapshot never invents facts from the system clock. Existing domain cooldown guards and the graph planning snapshot remain unchanged; timestamps are excluded from decision facts.
+
+The built-in rule accepts only the supported version, a complete and coherent fact schema, a Choice question, and a CONTINUE baseline. The Goal must remain eligible for continuation, with valid budget and criterion data and no Guard or Policy Override. A valid stale actual CONTINUE evaluation can propose RETRY; other supported continuable snapshots propose CONTINUE. The question must also accept that choice. Proposals carry `rule-goal-v2`. Unknown versions, incomplete facts, invalid evaluations, other scenarios, and unsupported states return BASELINE (`rule-v1`, no confidence).
+
+The rule never proposes COMPLETE or bypasses acceptance, permissions, budgets, leases, or domain scheduling constraints, and it does not schedule durable retries itself. `confidence=1` means a complete deterministic policy match, not a calibrated probability of model correctness. The default remains SHADOW: OFF and SHADOW retain the baseline, while ACTIVE requires explicit configuration and domain commit checks.
+
+## Long-task context and progress recovery
+
+This iteration borrows context ownership, tool-result recovery, and plan preservation ideas from [AgentScope Java harness 2.0.4](https://github.com/agentscope-ai/agentscope-java/tree/v2.0.4/agentscope-harness) within the existing runtime. It does not fully integrate HarnessAgent or add an external JEV service. The actual model view remains separate from canonical conversation records; compacting a display does not rewrite durable facts or authorization.
+
+When prefix budgeting is enabled, regular and automatic progress projections retain complete JSON entry boundaries and fit within the smaller of the current ledger allowance and an estimated 2000 tokens. Priority is BLOCKED, IN_PROGRESS, PENDING, then DONE, with status totals and omitted counts. Display keys, labels, and notes may be shortened; canonical entries stay complete. Very small budgets may omit the regular display. Pinned skill constraints remain complete in a separate block and still count toward the actual prompt; optional display limits cannot silently weaken them. Disabled budgeting and the legacy no-argument renderer retain compatibility behavior.
+
+Read-only `get_progress` obtains the current conversation from tool execution context and cannot select another conversation. Without a selector it pages entries (default 10, maximum 20). An exact original `stepKey` or overview `entryIndex` selects complete key, label, note, or the default serialized record text. Field chunks default to 256 and allow at most 512 UTF-16 characters; follow `nextOffset` until null. Chunks preserve surrogate pairs. Each JSON response is limited to 2400 characters, so escaping can reduce the returned page or chunk. Use entryIndex for shortened key previews or ambiguous keys across origins; refresh overview indices after ledger mutations.
+
+Reading progress does not mutate the ledger, create execution receipts, or trigger automatic progress feedback. Model-authored DONE values, labels, and notes are progress claims, not substitutes for actual tool results or Goal acceptance. Mark DONE after receiving a verifiable successful result; independent operations still execute and verify through the existing tool chain.
+
+TokenEstimator accounts for structured tool responses and tool-call arguments. Window control accounts for the actual non-history prefix, active tool schemas, history, and output reserve without double counting. Optional tail-history floors cannot exceed the remaining allowance. Retries should use the current compacted model view, preserve the prefix, original objective, and tool pairs, and obey the finite model-call ceiling. If mandatory content cannot fit, report a clear context error instead of silently slicing skill constraints or repeatedly sending oversized requests. Controlled regression checks establish these boundaries, not real-model accuracy or efficiency improvements.
+
+## Real-model validation boundary for this iteration
+
+Before these changes, clarified multi-stage prompts completed 16 DeepSeek long-task rounds; round 17 stopped with provider HTTP 402 (insufficient balance). Failed artifacts remain available, and two completed rounds required manual semantic review of final-answer consistency. Post-change real-model runs await usable balance or a configured available model. This baseline is not post-change acceptance evidence and does not establish a performance improvement.
+
+
+Pre-run history compaction and retry compaction share the same model-call guard. Actual pre-run summary calls and provider-reported token/cache usage seed the initial run state; cancellation after a successful summary preserves that usage and stops further execution. Finite call budgets reserve a subsequent reasoning opportunity, and known oversized summary prompts stop before transmission. Legacy entry points without a configured window remain compatible. Output reserves follow actual model options, including OpenAI maxCompletionTokens and Anthropic thinking overhead. Window estimates are not exact billing measurements.

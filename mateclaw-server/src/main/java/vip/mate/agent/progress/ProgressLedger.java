@@ -162,12 +162,16 @@ public final class ProgressLedger {
      *         when the ledger is empty so the caller can skip injection
      *         entirely (no "(empty)" placeholder noise).
      */
+    public String renderSnapshot(int regularBudgetTokens) {
+        return ProgressLedgerProjection.render(this, regularBudgetTokens);
+    }
+
     public String renderSnapshot() {
         if (isEmpty()) {
             return null;
         }
         StringBuilder sb = new StringBuilder(256);
-        sb.append("## 当前任务进度（执行参考，权威记录）\n\n");
+        sb.append("## 当前任务进度（执行参考，模型状态并非成功证据）\n\n");
 
         // Pinned constraints (highest priority — always visible)
         if (!pinned.isEmpty()) {
@@ -178,9 +182,7 @@ public final class ProgressLedger {
                 sb.append("- ").append(label);
                 String note = e.getNote();
                 if (note != null && !note.isBlank()) {
-                    String trimmed = note.length() > NOTE_PREVIEW_CHARS
-                            ? note.substring(0, NOTE_PREVIEW_CHARS) + "…"
-                            : note;
+                    String trimmed = note;
                     sb.append(" — ").append(trimmed);
                 }
                 sb.append('\n');

@@ -145,11 +145,13 @@ public class LoopMessageBudgeter {
         int hardTailCount = originalCount - hardTailStart;
         if (hardTailCount < cfg.minTailMessages()) {
             int floorTailStart = Math.max(headEnd, originalCount - cfg.minTailMessages());
-            // Honor the soft ceiling: if even the floor count would consume
-            // more than tailSoftCeilingTokens, accept it (the floor wins,
-            // since the alternative is losing recent reasoning entirely).
-            tailStart = floorTailStart;
-            minTailFloorApplied = true;
+            // The count floor is a heuristic, never a permission to retain
+            // ordinary messages beyond the actual remaining token allowance.
+            if (TokenEstimator.estimateTokens(messages.subList(floorTailStart, originalCount))
+                    <= cfg.tailSoftCeilingTokens()) {
+                tailStart = floorTailStart;
+                minTailFloorApplied = true;
+            }
         } else {
             // Apply the soft ceiling: if the hard cut undershoots the soft
             // ceiling (i.e. there's slack), keep going. We already cut to
@@ -163,7 +165,13 @@ public class LoopMessageBudgeter {
         boolean anchorEnforced = false;
         int anchorIdx = findLatestUserMessageIdx(messages, headEnd);
         if (anchorIdx >= 0 && anchorIdx < tailStart) {
-            tailStart = anchorIdx;
+            // Preserve a nearby anchor in place, but do not drag an entire
+            // long tool history back into a token-bounded tail. The build
+            // step below stitches a distant anchor ahead of the selected tail.
+            if (TokenEstimator.estimateTokens(messages.subList(anchorIdx, originalCount))
+                    <= cfg.tailSoftCeilingTokens()) {
+                tailStart = anchorIdx;
+            }
             anchorEnforced = true;
         }
 

@@ -304,8 +304,8 @@ class LoopMessageBudgeterTest {
     // ---- min-tail floor ----------------------------------------------------
 
     @Test
-    @DisplayName("minTailMessages: a single huge tool output doesn't collapse the tail")
-    void minTail_floorPreservesRecentContext() {
+    @DisplayName("minTailMessages: oversized ordinary history cannot override the token ceiling")
+    void minTail_floorDoesNotOverrideTokenCeiling() {
         // 50 fat history messages + an extremely fat last tool output that
         // alone exceeds the hard tail budget. Without the floor, the
         // backward walk in findTailCutByTokens would stop at just that one
@@ -325,12 +325,24 @@ class LoopMessageBudgeterTest {
         LoopMessageBudgeter.Result r = budgeter.budget(msgs, cfg);
 
         assertTrue(r.trace().triggered(), "token total exceeds trigger");
-        assertTrue(r.trace().minTailFloorApplied(),
-                "the floor must have engaged — last message alone exceeds hard tail budget");
-        assertTrue(r.trace().tailKept() >= 4,
-                "at least minTailMessages (4) entries should survive — got " + r.trace().tailKept());
+        assertFalse(r.trace().minTailFloorApplied(),
+                "an oversized ordinary history floor must not override the token ceiling");
+        assertTrue(r.trace().finalTokens() <= cfg.tailSoftCeilingTokens() + TokenEstimator.estimateTokens(msgs.get(0)),
+                "only affordable history and the protected anchor should survive");
         assertTrue(containsExact(r.messages(), "tail anchor"),
                 "anchor at the end must remain");
+    }
+
+    @Test
+    void minTailFloorStillExpandsWhenRecentMessagesFitSoftCeiling() {
+        List<Message> messages = new ArrayList<>();
+        for (int i=0;i<50;i++) messages.add(new AssistantMessage("x".repeat(2000)));
+        messages.add(new UserMessage("anchor"));
+        LoopBudgetConfig config = new LoopBudgetConfig(5_000,1_000,4,2.0,0,200);
+        var result = budgeter.budget(messages,config);
+        assertTrue(result.trace().minTailFloorApplied());
+        assertEquals(4,result.messages().size());
+        assertTrue(result.trace().finalTokens() <= config.tailSoftCeilingTokens());
     }
 
     // ---- pair-integrity-vs-cap reporting -----------------------------------

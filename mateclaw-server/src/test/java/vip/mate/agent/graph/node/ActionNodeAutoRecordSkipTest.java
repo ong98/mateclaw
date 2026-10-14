@@ -110,6 +110,7 @@ class ActionNodeAutoRecordSkipTest {
                 resp("load_skill", "loaded"),
                 resp("enable_tool", "enabled"),
                 resp("progress_update", "ok"),
+                resp("get_progress", "{\"entries\":[]}"),
                 resp("listAvailableSkills", "[]"),
                 resp("readSkillFile", "..."),
                 resp("runSkillScript", "...")));

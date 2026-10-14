@@ -102,7 +102,7 @@ public class ToolResultProperties {
      * reads are already self-paginated to a bounded size.</p>
      */
     private List<String> excludedTools = List.of(
-            "read_file", "read_workspace_memory_file", "readSkillFile", "load_skill");
+            "get_progress", "read_file", "read_workspace_memory_file", "readSkillFile", "load_skill");
 
     /**
      * Days to retain spill files before the scheduled cleanup deletes them.

@@ -322,19 +322,20 @@ class GoalEvaluationNodeContinuationTest {
         Fixture f = new Fixture();
         var adapter = mock(GoalDecisionAdapter.class);
         var ticket = new DecisionTicket("ticket", DecisionMode.ACTIVE, new DecisionValue.Choice("CONTINUE"));
-        when(adapter.selectGraph(any(), any(), any(), eq(false))).thenReturn(new GoalDecisionAdapter.Selection(ticket,
+        when(adapter.selectGraph(any(), any(), any(), eq(false), any())).thenReturn(new GoalDecisionAdapter.Selection(ticket,
                 new GoalContinuationDecision(GoalContinuationDecision.Action.CONTINUE, "selected prompt", LocalDateTime.now(), "remaining_criteria")));
         doThrow(new IllegalStateException("legacy audit unavailable")).when(f.goalService).recordFollowupInjected(any(), any());
         var node = f.node(); node.setDecisionAdapter(adapter);
         var output = node.apply(f.state(FinishReason.NORMAL.getValue(), 0, 0));
         assertEquals("selected prompt", output.get(MateClawStateKeys.GOAL_FOLLOWUP_PROMPT));
         verify(adapter).outcome(ticket, true, "FOLLOWUP_SUBMITTED");
+        verify(adapter).selectGraph(any(), any(), any(), eq(false), org.mockito.ArgumentMatchers.argThat(r -> r != null && r.llmCallsConsumed() == 1 && "stub-model".equals(r.evaluatorModel())));
     }
 
     @Test void graphCapsArePassedAsGuardsAndNeverRecordedAsSubmission() throws Exception {
         Fixture f = new Fixture(); var adapter = mock(GoalDecisionAdapter.class);
         var ticket = new DecisionTicket("ticket", DecisionMode.ACTIVE, new DecisionValue.Choice("DISABLED"));
-        when(adapter.selectGraph(any(), any(), any(), eq(true))).thenReturn(new GoalDecisionAdapter.Selection(ticket,
+        when(adapter.selectGraph(any(), any(), any(), eq(true), any())).thenReturn(new GoalDecisionAdapter.Selection(ticket,
                 new GoalContinuationDecision(GoalContinuationDecision.Action.CONTINUE, "selected prompt", LocalDateTime.now(), "remaining_criteria")));
         var node = f.node(); node.setDecisionAdapter(adapter);
         var output = node.apply(f.state(FinishReason.NORMAL.getValue(), f.properties.getMaxFollowupsPerRun(), 0));
@@ -344,7 +345,7 @@ class GoalEvaluationNodeContinuationTest {
 
     @Test void activeRecordingFailureEscapesGraphPlanningCatch() {
         Fixture f = new Fixture(); var adapter = mock(GoalDecisionAdapter.class);
-        when(adapter.selectGraph(any(), any(), any(), anyBoolean())).thenThrow(new DecisionRecordingException());
+        when(adapter.selectGraph(any(), any(), any(), anyBoolean(), any())).thenThrow(new DecisionRecordingException());
         var node = f.node(); node.setDecisionAdapter(adapter);
         assertThrows(DecisionRecordingException.class, () -> node.apply(f.state(FinishReason.NORMAL.getValue(), 0, 0)));
     }
@@ -381,7 +382,7 @@ class GoalEvaluationNodeContinuationTest {
     void activeDelayRecordsAppliedGraphSuppressionWithoutClaimingDurableScheduling(String action) throws Exception {
         Fixture f = new Fixture(); var adapter = mock(GoalDecisionAdapter.class);
         var ticket = new DecisionTicket("ticket", DecisionMode.ACTIVE, new DecisionValue.Choice(action));
-        when(adapter.selectGraph(any(), any(), any(), eq(false))).thenReturn(new GoalDecisionAdapter.Selection(ticket,
+        when(adapter.selectGraph(any(), any(), any(), eq(false), any())).thenReturn(new GoalDecisionAdapter.Selection(ticket,
                 new GoalContinuationDecision(GoalContinuationDecision.Action.valueOf(action), "original prompt",
                         LocalDateTime.now().plusSeconds(30), "decision_delay")));
         var node = f.node(); node.setDecisionAdapter(adapter);
@@ -397,7 +398,7 @@ class GoalEvaluationNodeContinuationTest {
         Fixture f = new Fixture(); var adapter = mock(GoalDecisionAdapter.class);
         when(f.followupService.maybeBuildFollowup(any(), any())).thenReturn(Optional.empty());
         var ticket = new DecisionTicket("ticket", DecisionMode.ACTIVE, new DecisionValue.Choice("DISABLED"));
-        when(adapter.selectGraph(any(), any(), any(), eq(false))).thenReturn(new GoalDecisionAdapter.Selection(ticket,
+        when(adapter.selectGraph(any(), any(), any(), eq(false), any())).thenReturn(new GoalDecisionAdapter.Selection(ticket,
                 new GoalContinuationDecision(GoalContinuationDecision.Action.DISABLED, null, null, "no_followup")));
         var node = f.node(); node.setDecisionAdapter(adapter);
         var output = node.apply(f.state(FinishReason.NORMAL.getValue(), 0, 0));

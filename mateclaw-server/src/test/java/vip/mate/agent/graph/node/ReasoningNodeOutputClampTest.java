@@ -30,6 +30,14 @@ class ReasoningNodeOutputClampTest {
     }
 
     @Test
+    void completionFieldSurvivesActualReasoningOptionsMutationAndIsReserved() {
+        var defaults=org.springframework.ai.openai.OpenAiChatOptions.builder().maxCompletionTokens(30000).build();
+        assertEquals(30000,ReasoningNode.outputReserveTokens(defaults,1024));
+        var actual=defaults.mutate().maxTokens(512).streamUsage(true).build();
+        assertEquals(30000,ReasoningNode.outputReserveTokens(actual,1024));
+    }
+
+    @Test
     @DisplayName("default 16384 cap on an 8k window clamps to half the window")
     void defaultCapClampsOnSmallWindow() {
         // Deprecated ctor leaves maxOutputTokens at the 16384 default.

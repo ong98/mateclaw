@@ -1,6 +1,8 @@
 package vip.mate.agent.context;
 
 import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.definition.ToolDefinition;
 
@@ -66,7 +68,20 @@ public final class TokenEstimator {
         if (message == null) {
             return 0;
         }
-        return estimateTokens(message.getText()) + PER_MESSAGE_OVERHEAD;
+        int total = estimateTokens(message.getText()) + PER_MESSAGE_OVERHEAD;
+        // Tool payloads are structured fields, absent from Message.getText().
+        if (message instanceof ToolResponseMessage response) {
+            for (var result : response.getResponses()) {
+                total += PER_MESSAGE_OVERHEAD + estimateTokens(result.id())
+                        + estimateTokens(result.name()) + estimateTokens(result.responseData());
+            }
+        } else if (message instanceof AssistantMessage assistant && assistant.getToolCalls() != null) {
+            for (var call : assistant.getToolCalls()) {
+                total += PER_MESSAGE_OVERHEAD + estimateTokens(call.id())
+                        + estimateTokens(call.type()) + estimateTokens(call.name()) + estimateTokens(call.arguments());
+            }
+        }
+        return total;
     }
 
     /**

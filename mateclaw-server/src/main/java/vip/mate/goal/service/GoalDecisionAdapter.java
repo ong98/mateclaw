@@ -19,7 +19,6 @@ import vip.mate.goal.model.GoalEvaluationResult;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Optional;
 
 /** Restricts continuation proposals to scheduling; completion remains a domain transition. */
@@ -46,7 +45,7 @@ public class GoalDecisionAdapter {
                             String attemptId, String phase) {
         GoalContinuationDecision baseline = followups.decide(goal, result, now);
         DecisionTicket ticket = request(goal, baseline.action(), attemptId, phase,
-                baseline.action() != Action.CONTINUE);
+                baseline.action() != Action.CONTINUE, result, now);
         return effective(ticket, baseline, now);
     }
 
@@ -63,14 +62,24 @@ public class GoalDecisionAdapter {
     }
 
     public Selection selectGraph(GoalEntity goal, Optional<String> followup, LocalDateTime now, boolean capped) {
+        return selectGraph(goal, followup, now, capped, null);
+    }
+
+    public Selection selectGraph(GoalEntity goal, Optional<String> followup, LocalDateTime now, boolean capped,
+                                 GoalEvaluationResult result) {
         GoalContinuationDecision baseline = followup.isPresent()
                 ? new GoalContinuationDecision(Action.CONTINUE, followup.get(), now, "remaining_criteria")
                 : new GoalContinuationDecision(Action.DISABLED, null, null, "no_followup");
         if (capped) return new Selection(request(goal, Action.DISABLED, null, "GRAPH_CAP", true), baseline);
-        return effective(request(goal, baseline.action(), null, "GRAPH", baseline.action() != Action.CONTINUE), baseline, now);
+        return effective(request(goal, baseline.action(), null, "GRAPH", baseline.action() != Action.CONTINUE, result, now), baseline, now);
     }
 
     private DecisionTicket request(GoalEntity goal, Action action, String attemptId, String phase, boolean guarded) {
+        return request(goal, action, attemptId, phase, guarded, null, null);
+    }
+
+    private DecisionTicket request(GoalEntity goal, Action action, String attemptId, String phase, boolean guarded,
+                                   GoalEvaluationResult result, LocalDateTime now) {
         DecisionValue.Choice baseline = new DecisionValue.Choice(action.name());
         List<DecisionQuestion.Option> options = guarded
                 ? List.of(new DecisionQuestion.Option(action.name(), "Existing domain guard"))
@@ -80,10 +89,9 @@ public class GoalDecisionAdapter {
         DecisionScope scope = new DecisionScope(goal == null ? null : goal.getWorkspaceId(),
                 goal == null ? null : goal.getId(), null,
                 identifier(goal == null ? null : goal.getConversationId()), identifier(attemptId));
-        DecisionFacts facts = new DecisionFacts(Map.of("PERSISTENT", goal != null && Boolean.TRUE.equals(goal.getPersistentExecution())),
-                Map.of("TURNS_USED", goal == null || goal.getTurnsUsed() == null ? 0d : goal.getTurnsUsed().doubleValue()));
+        DecisionFacts facts = GoalDecisionFacts.snapshot(goal, result, now);
         return decisions.decide(new DecisionRequest(DecisionType.GOAL_CONTINUATION, scope, phase,
-                new DecisionQuestion.Choice("goal-continuation-v1", "Schedule bounded goal continuation", options),
+                new DecisionQuestion.Choice(GoalDecisionFacts.VERSION, "Schedule bounded goal continuation", options),
                 facts, baseline, guarded ? baseline : null, null));
     }
 

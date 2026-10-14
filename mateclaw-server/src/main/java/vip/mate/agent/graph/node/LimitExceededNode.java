@@ -8,6 +8,10 @@ import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.chat.prompt.ChatOptions;
+import org.springframework.ai.model.tool.ToolCallingChatOptions;
+import vip.mate.llm.chatmodel.ChatModelDefaults;
+import vip.mate.agent.context.TokenEstimator;
 import vip.mate.agent.graph.NodeStreamingChatHelper;
 import vip.mate.agent.graph.observation.ObservationProcessor;
 import vip.mate.agent.graph.state.FinishReason;
@@ -55,6 +59,12 @@ public class LimitExceededNode implements NodeAction {
      * Null in legacy/test constructors — the wrap behaves as before.
      */
     private final vip.mate.agent.progress.ProgressLedgerService progressLedgerService;
+
+    private vip.mate.agent.context.PrefixBudgetPlan prefixBudgetPlan;
+
+    public void setPrefixBudgetPlan(vip.mate.agent.context.PrefixBudgetPlan plan) {
+        this.prefixBudgetPlan = plan;
+    }
 
     public LimitExceededNode(ChatModel chatModel, ObservationProcessor observationProcessor,
                              NodeStreamingChatHelper streamingHelper) {
@@ -124,7 +134,9 @@ public class LimitExceededNode implements NodeAction {
         String ledgerSnapshot = null;
         if (progressLedgerService != null && conversationId != null && !conversationId.isBlank()) {
             try {
-                ledgerSnapshot = progressLedgerService.load(conversationId).renderSnapshot();
+                var ledger = progressLedgerService.load(conversationId);
+                ledgerSnapshot = prefixBudgetPlan != null && prefixBudgetPlan.enabled()
+                        ? ledger.renderSnapshot(prefixBudgetPlan.ledgerTokens()) : ledger.renderSnapshot();
             } catch (Exception e) {
                 log.warn("[LimitExceededNode] Failed to load progress ledger for {}: {}",
                         conversationId, e.getMessage());
@@ -142,11 +154,38 @@ public class LimitExceededNode implements NodeAction {
 
         List<Message> promptMessages = new ArrayList<>();
         promptMessages.add(new SystemMessage(systemPrompt));
+        String executionFacts = accessor.actionExecutionLedger().renderAnswerFacts();
+        if (!executionFacts.isBlank()) promptMessages.add(new SystemMessage(executionFacts));
         promptMessages.add(new UserMessage(userPrompt));
 
-        // 流式调用 LLM，实时推送 content/thinking
+        ChatOptions options = null;
+        if (prefixBudgetPlan != null && prefixBudgetPlan.enabled()) {
+            ChatOptions defaults = ChatModelDefaults.optionsFor(chatModel);
+            int outputReserve = ReasoningNode.outputReserveTokens(defaults,1024);
+            boolean declaredOutput = defaults != null && (defaults.getMaxTokens() != null
+                    || defaults instanceof org.springframework.ai.openai.OpenAiChatOptions openAi
+                    && openAi.getMaxCompletionTokens() != null);
+            options = declaredOutput ? defaults.mutate().build()
+                    : defaults != null ? defaults.mutate().maxTokens(outputReserve).build()
+                    : ChatOptions.builder().maxTokens(outputReserve).build();
+            if (options instanceof ToolCallingChatOptions toolOptions) {
+                options = toolOptions.mutate().toolCallbacks(List.of()).build();
+            }
+            int total = TokenEstimator.estimateTokens(promptMessages) + outputReserve;
+            if (total > prefixBudgetPlan.effectiveMaxTokens()) {
+                log.error("[LimitExceededNode] Wrap-up prompt estimate {} + output {} exceeds window {}",
+                        TokenEstimator.estimateTokens(promptMessages),outputReserve,prefixBudgetPlan.effectiveMaxTokens());
+                return MateClawStateAccessor.output()
+                        .finalAnswerDraft("（必需任务记录与输出预留超过模型上下文窗口，无法安全生成总结。任务尚未完成。）")
+                        .llmCallCount(accessor.llmCallCount()).limitExceeded(true)
+                        .contentStreamed(false).thinkingStreamed(accessor.thinkingStreamed())
+                        .finishReason(FinishReason.INCOMPLETE).build();
+            }
+        }
+        // The graceful wrap retains its separate one-call allowance and advertises no tools.
+        Prompt prompt = options == null ? new Prompt(promptMessages) : new Prompt(promptMessages,options);
         NodeStreamingChatHelper.StreamResult result = streamingHelper.streamCall(
-                chatModel, new Prompt(promptMessages), conversationId, "limit_exceeded");
+                chatModel, prompt, conversationId, "limit_exceeded");
 
         String finalDraft = result.text();
 
@@ -158,6 +197,7 @@ public class LimitExceededNode implements NodeAction {
                 : "Sorry, the maximum reasoning steps were reached.";
         return MateClawStateAccessor.output()
                 .finalAnswerDraft(finalDraft != null ? finalDraft : fallbackMsg)
+                .llmCallCount(accessor.llmCallCount()+1)
                 .currentThinking(result.thinking())
                 .limitExceeded(true)
                 .contentStreamed(true)

@@ -13,6 +13,7 @@ import static vip.mate.agent.graph.state.MateClawStateKeys.*;
  *   <li>迭代超限 → limitExceededNode</li>
  *   <li>可直接回答（含 fatal error 自带的错误文案） → finalAnswerNode</li>
  *   <li>LLM 调用次数超限 → limitExceededNode（仅拦截继续循环的路径）</li>
+ *   <li>完成门要求继续推理 → reasoningNode</li>
  *   <li>需要工具调用 → actionNode</li>
  *   <li>需要总结压缩 → summarizingNode</li>
  *   <li>兜底 → finalAnswerNode</li>
@@ -41,46 +42,47 @@ public class ReasoningDispatcher implements EdgeAction {
             return LIMIT_EXCEEDED_NODE;
         }
 
-        if (accessor.continueReasoning()) {
-            log.info("[ReasoningDispatcher] Completion gate requested another reasoning pass");
-            return REASONING_NODE;
-        }
-
         // 2. 可直接回答 → finalAnswerNode
         //    覆盖以下场景：
         //    - LLM 正常产出最终回答 (needsToolCall=false, finalAnswer 非空)
         //    - fatal error (ReasoningNode 设置了 finalAnswer=错误文案 + finishReason=ERROR_FALLBACK)
         //    - 用户停止无内容 (finalAnswer="" + finishReason=STOPPED)
         //    不受 llm_call_count 限制 — 已有结果不应丢弃。
-        if (!accessor.needsToolCall() && !accessor.shouldSummarize()) {
+        if (!accessor.continueReasoning() && !accessor.needsToolCall() && !accessor.shouldSummarize()) {
             log.debug("[ReasoningDispatcher] Routing to finalAnswerNode (direct answer)");
             return FINAL_ANSWER_NODE;
         }
 
-        // 3. LLM 调用次数超限 — 仅拦截继续循环（工具调用/总结）的路径（maxIterations=0 不限制）
+        // 3. LLM 调用次数超限 — 拦截所有继续循环的路径（maxIterations=0 不限制）
         int llmCallCount = accessor.llmCallCount();
         int maxIter = accessor.maxIterations();
-        int llmCallLimit = maxIter > 0 ? maxIter * LLM_CALL_MULTIPLIER : Integer.MAX_VALUE;
-        if (llmCallCount >= llmCallLimit) {
+        long llmCallLimit = (long) maxIter * LLM_CALL_MULTIPLIER;
+        if (maxIter > 0 && llmCallCount >= llmCallLimit) {
             log.warn("[ReasoningDispatcher] LLM call count limit reached ({}/{}), " +
                             "routing to limitExceededNode instead of continuing loop",
                     llmCallCount, llmCallLimit);
             return LIMIT_EXCEEDED_NODE;
         }
 
-        // 4. 工具调用
+        // 4. 完成门要求继续推理
+        if (accessor.continueReasoning()) {
+            log.info("[ReasoningDispatcher] Completion gate requested another reasoning pass");
+            return REASONING_NODE;
+        }
+
+        // 5. 工具调用
         if (accessor.needsToolCall()) {
             log.debug("[ReasoningDispatcher] Routing to actionNode (tool call needed)");
             return ACTION_NODE;
         }
 
-        // 5. 需要总结
+        // 6. 需要总结
         if (accessor.shouldSummarize()) {
             log.info("[ReasoningDispatcher] Routing to summarizingNode (observation context too large)");
             return SUMMARIZING_NODE;
         }
 
-        // 6. 兜底
+        // 7. 兜底
         log.debug("[ReasoningDispatcher] Routing to finalAnswerNode (fallback)");
         return FINAL_ANSWER_NODE;
     }

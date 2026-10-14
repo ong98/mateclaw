@@ -325,7 +325,7 @@ public class GoalEvaluationNode implements NodeAction {
         boolean hardCapReached = reactIterationCapReached && hardContinuationCount >= hardCap;
         // Caps are deterministic guards and must be resolved before consulting a provider.
         GoalDecisionAdapter.Selection selection = decisionAdapter == null || !planningSucceeded ? null
-                : decisionAdapter.selectGraph(refreshed, followup, LocalDateTime.now(), perRunCapReached || hardCapReached);
+                : decisionAdapter.selectGraph(refreshed, followup, LocalDateTime.now(), perRunCapReached || hardCapReached, result);
         boolean followupSuppressed = selection != null && selection.ticket().mode() == DecisionMode.ACTIVE
                 && followup.isPresent() && !perRunCapReached && !hardCapReached
                 && (selection.decision().action() == Action.DEFER || selection.decision().action() == Action.RETRY);
