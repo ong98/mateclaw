@@ -19,10 +19,12 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 import static org.mockito.ArgumentMatchers.*;
 import static vip.mate.agent.graph.state.MateClawStateKeys.*;
+/** 验证进度事实、回执与会话历史在模型上下文预算内保持完整。 */
 class ReasoningNodeProgressBudgetTest {
+ /** 压缩后的重试请求也必须满足实际模型窗口限制。 */
  @Test void compressedRetryIsCheckedAgainstActualWindowBeforeProviderCall() throws Exception {
   var helper=mock(NodeStreamingChatHelper.class);var window=mock(ConversationWindowManager.class);
-  when(window.compactAgedToolResponses(anyList(),anyInt())).thenAnswer(inv->inv.getArgument(0));
+  when(window.compactAgedToolResponses(anyList(),anyInt(),anyString(),nullable(String.class))).thenAnswer(inv->inv.getArgument(0));
   when(window.pruneOldToolResultsForModelInput(anyList(),anyString(),anyString())).thenAnswer(inv->inv.getArgument(0));
   when(window.compactForRetry(anyList(),any(),anyString(),any())).thenReturn(List.of(new UserMessage("界".repeat(10000))));
   when(helper.streamCall(any(),any(),anyString(),anyString())).thenReturn(new NodeStreamingChatHelper.StreamResult(null,null,null,List.of(),false,0,0,false,"provider prompt too long",NodeStreamingChatHelper.ErrorType.PROMPT_TOO_LONG,false,0,0,0));
@@ -53,10 +55,11 @@ class ReasoningNodeProgressBudgetTest {
   assertTrue(TokenEstimator.estimateTokens(cap.getValue().getInstructions())+1024<=24000,
           "captured prompt estimate="+TokenEstimator.estimateTokens(cap.getValue().getInstructions()));
  }
+ /** 最新工具调用对无法放入窗口时，不调用模型或尝试无效压缩。 */
  @Test void unfitLatestToolPairReturnsTypedErrorWithoutModelOrCompaction() throws Exception {
   var helper=mock(NodeStreamingChatHelper.class);var service=mock(ProgressLedgerService.class);
   var window=mock(ConversationWindowManager.class);
-  when(window.compactAgedToolResponses(anyList(),anyInt())).thenAnswer(inv->inv.getArgument(0));
+  when(window.compactAgedToolResponses(anyList(),anyInt(),anyString(),nullable(String.class))).thenAnswer(inv->inv.getArgument(0));
   when(window.pruneOldToolResultsForModelInput(anyList(),anyString(),anyString())).thenAnswer(inv->inv.getArgument(0));
   when(helper.streamCall(any(),any(),anyString(),anyString())).thenReturn(new NodeStreamingChatHelper.StreamResult("unexpected","",new AssistantMessage("unexpected"),List.of(),false,0,0));
   when(service.load("conv")).thenReturn(new ProgressLedger(Map.of(),Map.of("pin_skill",new ProgressEntry("pin_skill","skill",ProgressStatus.PENDING,"界".repeat(15000),Instant.now()))));
@@ -91,11 +94,12 @@ class ReasoningNodeProgressBudgetTest {
   assertTrue(cap.getValue().getInstructions().stream().anyMatch(m->m.getText().contains("界".repeat(15000))));
   assertTrue(TokenEstimator.estimateTokens(cap.getValue().getInstructions())+1024<=24000);
  }
+ /** 完整约束自身超过窗口时立即停止，避免徒劳压缩历史。 */
  @Test void impossibleCompletePinsFailFastWithoutTryingHistoryCompaction() throws Exception {
   var helper=mock(NodeStreamingChatHelper.class);var service=mock(ProgressLedgerService.class);
   var window=mock(ConversationWindowManager.class);
   when(helper.streamCall(any(),any(),anyString(),anyString())).thenReturn(new NodeStreamingChatHelper.StreamResult("unexpected retry","",new AssistantMessage("unexpected retry"),List.of(),false,0,0));
-  when(window.compactAgedToolResponses(anyList(),anyInt())).thenAnswer(inv->inv.getArgument(0));
+  when(window.compactAgedToolResponses(anyList(),anyInt(),anyString(),nullable(String.class))).thenAnswer(inv->inv.getArgument(0));
   when(window.pruneOldToolResultsForModelInput(anyList(),anyString(),anyString())).thenAnswer(inv->inv.getArgument(0));
   when(window.compactForRetry(anyList(),any(),anyString(),any())).thenReturn(List.of());
   when(service.load("conv")).thenReturn(new ProgressLedger(Map.of(),Map.of("pin_skill",new ProgressEntry("pin_skill","skill",ProgressStatus.PENDING,"界".repeat(10000),Instant.now()))));

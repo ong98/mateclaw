@@ -16,6 +16,7 @@ import static org.mockito.Mockito.*;
 import static org.mockito.ArgumentMatchers.*;
 import static vip.mate.agent.graph.state.MateClawStateKeys.*;
 
+/** 验证模型重试、摘要调用和取消行为遵循实际调用预算。 */
 class ReasoningNodeRetryBudgetTest {
     private static NodeStreamingChatHelper.StreamResult blank() {
         return new NodeStreamingChatHelper.StreamResult("","",new AssistantMessage(""),List.of(),false,0,0);
@@ -44,9 +45,10 @@ class ReasoningNodeRetryBudgetTest {
     private RunState state(List<Message> messages,int max,int consumed) {
         return new RunState(Map.of(CONVERSATION_ID,"conv",SYSTEM_PROMPT,"system",USER_MESSAGE,"ORIGINAL_OBJECTIVE",MESSAGES,messages,MAX_ITERATIONS,max,LLM_CALL_COUNT,consumed));
     }
+    /** 构建保留原始消息的上下文模拟器，使测试聚焦重试预算而非回执存储。 */
     private ConversationWindowManager window() {
         var window=mock(ConversationWindowManager.class);
-        when(window.compactAgedToolResponses(anyList(),anyInt())).thenAnswer(inv->inv.getArgument(0));
+        when(window.compactAgedToolResponses(anyList(),anyInt(),anyString(),nullable(String.class))).thenAnswer(inv->inv.getArgument(0));
         when(window.pruneOldToolResultsForModelInput(anyList(),anyString(),anyString())).thenAnswer(inv->inv.getArgument(0));
         return window;
     }
