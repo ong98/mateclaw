@@ -17,19 +17,11 @@ import vip.mate.workspace.conversation.model.MessageEntity;
 import java.util.List;
 
 /**
- * On-demand image analysis tool.
+ * 按问题分析会话上传附件或 MCP 返回的原图，向主模型提供可核实的视觉证据。
  *
- * <p>When the agent's primary model is text-only, images uploaded earlier in the
- * conversation are only captioned generically once (by the automatic vision
- * sidecar) and that caption is frozen into history. This tool lets the agent
- * re-examine a previously uploaded image against the user's actual follow-up
- * question — passing the question to the configured vision model so the answer is
- * tailored rather than a stale generic description.
- *
- * <p>It resolves the target image from the current conversation: an explicit
- * filename/path reference, or the most recent image when none is given. It reuses
- * the same vision model the automatic sidecar uses, so behaviour stays consistent
- * across the automatic and on-demand paths.
+ * <p>上传附件按文件名定位，省略名称时选取最近的上传图片。MCP 原图必须使用工具
+ * 响应中的完整图片标识，只允许读取当前会话的媒体，不开放任意文件路径。
+ * 图片与本轮问题一起发送给已配置的默认视觉模型，返回具体的画面证据供主模型使用。
  *
  * @author MateClaw Team
  */
@@ -42,15 +34,35 @@ public class ImageAnalyzeTool {
     private final MultimodalRouter multimodalRouter;
     private final MediaCaptionService mediaCaptionService;
 
-    @Tool(description = "Analyze an image the user uploaded earlier in this conversation, answering a specific "
+    /** 解析当前会话中 MCP 返回的图片引用。 */
+    private vip.mate.tool.mcp.runtime.McpImageStore mcpImageStore;
+
+    /**
+     * 注入会话范围内的 MCP 图片解析服务。
+     * @param store MCP 原图存储服务
+     */
+    @org.springframework.beans.factory.annotation.Autowired
+    public void setMcpImageStore(vip.mate.tool.mcp.runtime.McpImageStore store) {
+        this.mcpImageStore = store;
+    }
+
+    /**
+     * 将指定会话图片与具体问题送入默认视觉模型，返回视觉识别证据。
+     * @param question 需要结合原图回答的具体问题
+     * @param image 上传附件名称，或 MCP 响应中返回的 mcp-image 图片标识
+     * @param ctx 当前会话上下文
+     * @return 图片分析结果；缺少图片、模型或分析失败时返回明确的说明
+     */
+    @Tool(description = "Analyze an image uploaded or returned by an MCP tool in this conversation, answering a specific "
             + "question about it. Use this whenever the user asks a follow-up about a previously sent image "
             + "(e.g. 'what does the error in that screenshot say', 'read the total on the receipt') and the "
             + "current model cannot see images natively. By default it analyzes the most recent image; pass "
-            + "'image' to target a specific one by filename. Returns the vision model's answer as text.")
+            + "'image' to target a specific one by filename. For MCP images, always pass the exact mcp-image-* "
+            + "reference returned by the tool. Returns the vision model's answer as text.")
     public String image_analyze(
             @ToolParam(description = "The specific question to answer about the image, in the user's own words. "
                     + "Be concrete — e.g. 'What is the error message?' rather than 'describe it'.") String question,
-            @ToolParam(description = "Optional filename or path of the target image. Omit to use the most recent "
+            @ToolParam(description = "MCP image reference (mcp-image-*.jpg/png/webp/gif), or optional filename of an uploaded image. Omit to use the most recent "
                     + "image in the conversation.", required = false) String image,
             @Nullable ToolContext ctx
     ) {
@@ -63,7 +75,8 @@ public class ImageAnalyzeTool {
             return "无法确定当前会话，无法定位已上传的图片。";
         }
 
-        MessageContentPart target = findImagePart(conversationId, image);
+        MessageContentPart target = mcpImageStore == null ? null : mcpImageStore.find(image, ctx);
+        if (target == null) target = findImagePart(conversationId, image);
         if (target == null) {
             return image == null || image.isBlank()
                     ? "本次会话中没有找到可分析的图片，请确认用户已上传图片。"

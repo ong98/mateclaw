@@ -6,8 +6,7 @@ import org.springframework.ai.tool.definition.ToolDefinition;
 import org.springframework.ai.tool.metadata.ToolMetadata;
 
 /**
- * RFC-052 §3.4: thin decorator that overrides {@link ToolCallback#getToolMetadata()}
- * to report {@code returnDirect=true} for MCP tools.
+ * 将 MCP 工具标记为直接返回用户，并禁止图片处理把结果额外发送到视觉模型。
  *
  * <p>Spring AI 1.1.4's {@code SyncMcpToolCallback} / {@code AsyncMcpToolCallback}
  * never override {@code getToolMetadata()} (they inherit the framework default
@@ -16,8 +15,7 @@ import org.springframework.ai.tool.metadata.ToolMetadata;
  * time when their server+tool config opts in via
  * {@code mateclaw.mcp.return-direct.tools}.
  *
- * <p>Everything else (definition, invocation, exceptions) is delegated verbatim
- * — guard, approval, observability, audit all see the original callback.
+ * <p>工具定义、参数和异常继续透传；仅在本地调用上下文添加图片隔离标记。
  *
  * @author MateClaw Team
  */
@@ -45,14 +43,28 @@ public final class ReturnDirectMcpToolCallback implements ToolCallback {
         return RETURN_DIRECT_METADATA;
     }
 
+    /**
+     * 使用带图片隔离标记的上下文执行直接返回调用。
+     * @param arguments 原始工具参数
+     * @return 直接交给用户的工具内容
+     */
     @Override
     public String call(String arguments) {
-        return delegate.call(arguments);
+        return call(arguments, null);
     }
 
+    /**
+     * 直接返回工具内容，禁止媒体解析路径将数据额外发送给视觉模型。
+     * @param arguments 原始工具参数
+     * @param toolContext 当前工具执行上下文
+     * @return 直接交给用户的工具内容
+     */
     @Override
     public String call(String arguments, ToolContext toolContext) {
-        return delegate.call(arguments, toolContext);
+        java.util.Map<String, Object> values = new java.util.HashMap<>();
+        if (toolContext != null) values.putAll(toolContext.getContext());
+        values.put(McpImageStore.SKIP_VISION_CONTEXT_KEY, true);
+        return delegate.call(arguments, new ToolContext(values));
     }
 
     /** Test/diagnostic accessor — not part of the framework contract. */

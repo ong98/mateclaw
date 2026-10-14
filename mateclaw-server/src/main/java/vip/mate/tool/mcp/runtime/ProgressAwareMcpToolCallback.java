@@ -14,9 +14,7 @@ import org.springframework.ai.tool.metadata.ToolMetadata;
 import java.util.Map;
 
 /**
- * MCP tool callback wrapper that injects {@code _meta.progressToken} into
- * {@code tools/call} requests, enabling MCP Servers to push progress via
- * {@code notifications/progress}.
+ * 为 MCP 调用注入进度令牌，捕获结构化结果，并将原图保存为会话内视觉引用。
  *
  * <p>When {@code MCP_PROGRESS_TOKEN} is present in {@link ToolContext}, this wrapper
  * calls {@link McpSyncClient#callTool(McpSchema.CallToolRequest)} directly with the
@@ -34,6 +32,17 @@ public final class ProgressAwareMcpToolCallback implements ToolCallback {
     private final McpSyncClient mcpClient;
     private final String rawToolName;
     private final ObjectMapper objectMapper;
+
+    /** 与常规调用共用的图片存储，避免进度调用将图片串成 Base64 文本。 */
+    private McpImageStore imageStore;
+
+    /**
+     * 配置图片处理服务。
+     * @param imageStore 当前会话图片存储服务
+     */
+    public void setImageStore(McpImageStore imageStore) {
+        this.imageStore = imageStore;
+    }
 
     public ProgressAwareMcpToolCallback(ToolCallback delegate, McpSyncClient mcpClient,
                                         String rawToolName, ObjectMapper objectMapper) {
@@ -58,6 +67,13 @@ public final class ProgressAwareMcpToolCallback implements ToolCallback {
         return delegate.call(toolInput);
     }
 
+    /**
+     * 执行一次远端调用，保留身份与进度信息，并将图片转换为视觉分析引用。
+     * @param toolInput 工具 JSON 参数
+     * @param toolContext 当前会话上下文与进度令牌
+     * @return 文本结果及图片引用，不含已保存图片的 Base64
+     * @throws ToolExecutionException 远端调用或协议响应失败时抛出，不重放业务操作
+     */
     @Override
     public String call(String toolInput, ToolContext toolContext) {
         String progressToken = null;
@@ -97,7 +113,7 @@ public final class ProgressAwareMcpToolCallback implements ToolCallback {
             throw new ToolExecutionException(getToolDefinition(),
                     new IllegalStateException("Error calling tool: " + result.content()));
         }
-        return serializeResult(result);
+        return serializeResult(result, toolContext);
     }
 
     private Map<String, Object> parseArguments(String toolInput) {
@@ -110,7 +126,13 @@ public final class ProgressAwareMcpToolCallback implements ToolCallback {
         }
     }
 
-    private String serializeResult(McpSchema.CallToolResult result) {
+    /**
+     * 保留普通文本及结构化结果，将图片数据交给存储服务处理。
+     * @param result 成功的 MCP 响应
+     * @param context 当前会话上下文
+     * @return 可交给文本模型的结果与图片分析指引
+     */
+    private String serializeResult(McpSchema.CallToolResult result, ToolContext context) {
         if (result == null) return "";
         if (result.content() == null || result.content().isEmpty()) {
             if (result.structuredContent() == null) return "";
@@ -124,6 +146,8 @@ public final class ProgressAwareMcpToolCallback implements ToolCallback {
         for (var content : result.content()) {
             if (content instanceof McpSchema.TextContent tc) {
                 sb.append(tc.text());
+            } else if (content instanceof McpSchema.ImageContent image && imageStore != null) {
+                sb.append(imageStore.describe(image, context));
             } else {
                 sb.append(content.toString());
             }

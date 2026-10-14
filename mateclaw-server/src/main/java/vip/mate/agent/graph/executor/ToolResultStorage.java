@@ -331,6 +331,19 @@ public class ToolResultStorage {
         return base.resolve(safeConv).resolve(safeId + ".txt");
     }
 
+    /**
+     * 解析工具媒体与文本共用的会话目录，沿用工作区隔离和清理生命周期。
+     *
+     * @param conversationId 当前会话标识，不能为空
+     * @param workspaceBasePath 当前工作区目录；未绑定时使用配置目录或临时目录
+     * @return 会话目录；缺少会话或隔离目录时返回 {@code null}
+     */
+    public Path resolveConversationDirectory(String conversationId, String workspaceBasePath) {
+        if (conversationId == null || conversationId.isBlank()) return null;
+        Path base = resolveBaseDir(workspaceBasePath);
+        return base == null ? null : base.resolve(sanitize(conversationId));
+    }
+
     private Path resolveBaseDir(String workspaceBasePath) {
         Path base;
         boolean outsideWorkspace;

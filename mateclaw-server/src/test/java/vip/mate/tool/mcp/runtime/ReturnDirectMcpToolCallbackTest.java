@@ -10,8 +10,7 @@ import org.springframework.ai.tool.metadata.ToolMetadata;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * RFC-052 PR-4: verify the MCP returnDirect decorator only changes
- * {@link ToolMetadata#returnDirect()} and delegates everything else.
+ * 验证直接返回工具的元数据和参数保持原样，并禁止图片自动进入视觉模型。
  */
 class ReturnDirectMcpToolCallbackTest {
 
@@ -33,15 +32,16 @@ class ReturnDirectMcpToolCallbackTest {
 
     @Test
     @DisplayName("call(args) and call(args, ctx) both delegate")
+    /** 两种调用入口均传递图片隔离标记，防止自动媒体分析越过直接返回边界。 */
     void delegatesInvocations() {
         RecordingDelegate delegate = new RecordingDelegate();
         ToolCallback wrapped = new ReturnDirectMcpToolCallback(delegate);
 
-        assertEquals("called: x", wrapped.call("x"));
-        assertEquals(1, delegate.callCount);
+        assertEquals("called-ctx: x", wrapped.call("x"));
+        assertEquals(0, delegate.callCount);
 
         assertEquals("called-ctx: y", wrapped.call("y", null));
-        assertEquals(1, delegate.callCtxCount);
+        assertEquals(2, delegate.callCtxCount);
     }
 
     @Test
@@ -83,8 +83,15 @@ class ReturnDirectMcpToolCallbackTest {
             return "called: " + arguments;
         }
 
+        /**
+         * 记录上下文调用并校验图片隔离标记。
+         * @param arguments 原始工具参数
+         * @param toolContext 平台工具上下文
+         * @return 用于校验参数透传的文本
+         */
         @Override
         public String call(String arguments, ToolContext toolContext) {
+            assertEquals(true, toolContext.getContext().get(McpImageStore.SKIP_VISION_CONTEXT_KEY));
             callCtxCount++;
             return "called-ctx: " + arguments;
         }

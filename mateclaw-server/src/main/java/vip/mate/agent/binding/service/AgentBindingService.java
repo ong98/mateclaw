@@ -677,7 +677,7 @@ public class AgentBindingService implements AgentBindingResolver {
             "enable_tool", "tool_search", "tool_describe", "tool_call"
     );
 
-    /** Compatibility defaults for skill-bound agents that have NOT disabled tools. */
+    /** 已绑定技能且未关闭工具的员工默认保留的通用能力，包含图片生成与分析。 */
     private static final Set<String> SYSTEM_LEVEL_TOOLS = Set.of(
             // Structured memory primitives — used by every agent regardless
             // of skill bindings, otherwise the self-evolution path collapses
@@ -768,6 +768,8 @@ public class AgentBindingService implements AgentBindingResolver {
             "renderDocxFromFile",
             "renderDocxFromFiles",
             "image_generate",
+            // 图片分析与生成一样，在绑定业务技能后仍默认可用。
+            "image_analyze",
             "music_generate",
             "video_generate",
             // HTML → PNG rasteriser. Closes the loop for HTML-producing skills

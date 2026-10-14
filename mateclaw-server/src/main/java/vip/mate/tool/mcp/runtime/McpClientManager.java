@@ -71,6 +71,18 @@ public class McpClientManager {
 
     private final ObjectMapper objectMapper;
 
+    /** 将 MCP 图片转为会话内引用，供视觉分析读取完整原图。 */
+    private McpImageStore imageStore;
+
+    /**
+     * 注入工具图片存储，供常规和进度回调共用。
+     * @param imageStore 会话范围内的 MCP 图片存储服务
+     */
+    @org.springframework.beans.factory.annotation.Autowired
+    public void setImageStore(McpImageStore imageStore) {
+        this.imageStore = imageStore;
+    }
+
     /** serverId -> server name, captured at build time for identity-forward opt-in matching. */
     private final ConcurrentHashMap<Long, String> serverNames = new ConcurrentHashMap<>();
 
@@ -185,17 +197,9 @@ public class McpClientManager {
     }
 
     /**
-     * Collect ToolCallbacks from every active MCP client, with each callback's
-     * name rewritten to a server-id-anchored prefix
-     * (see {@link McpToolNameResolver}). Two guarantees:
-     * <ul>
-     *   <li>Two MCP servers can expose the same raw tool name without one
-     *       silently overwriting the other in a name-keyed map downstream.</li>
-     *   <li>If two raw names within the same server happen to hash to the
-     *       same prefixed name, only the first survives —
-     *       {@link McpHashCollisionDetector} flags the second so the picker
-     *       can refuse to bind it.</li>
-     * </ul>
+     * 收集活动 MCP 客户端的回调，按服务前缀避免重名，并注入身份、进度和原图存储能力。
+     * 同一服务的工具名称冲突时只保留首个可绑定项；连接临时失败时沿用最近的可用快照。
+     * @return 可用于员工工具集合的回调列表
      */
     public List<ToolCallback> getAllToolCallbacks() {
         List<ToolCallback> allCallbacks = new ArrayList<>();
@@ -204,7 +208,7 @@ public class McpClientManager {
             try {
                 ToolCallback[] cbs = entry.getValue().listTools().tools().stream()
                         .filter(tool -> tool.name() != null && !tool.name().isBlank())
-                        .map(tool -> new ApplicationMcpToolCallback(entry.getValue(), tool))
+                        .map(tool -> new ApplicationMcpToolCallback(entry.getValue(), tool, imageStore))
                         .toArray(ToolCallback[]::new);
                 if (cbs != null && cbs.length > 0) {
                     String serverName = serverNames.get(serverId);
@@ -213,6 +217,12 @@ public class McpClientManager {
                     String audience = idSvc != null ? identityForwardService.audienceFor(serverId, serverName) : null;
                     List<ToolCallback> wrapped = wrapServerCallbacks(serverId, cbs, idSvc, audience, serverName,
                             entry.getValue(), objectMapper);
+                    for (ToolCallback callback : wrapped) {
+                        if (callback instanceof PrefixedNameToolCallback prefixed
+                                && prefixed.getDelegate() instanceof ProgressAwareMcpToolCallback progress) {
+                            progress.setImageStore(imageStore);
+                        }
+                    }
                     lastGoodCallbacks.put(serverId, wrapped);
                     allCallbacks.addAll(wrapped);
                     continue;
