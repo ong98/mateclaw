@@ -30,6 +30,15 @@ public class ProgressLedgerTool {
 
     private final ProgressLedgerService service;
 
+    /**
+     * 保存当前步骤的进度与办理交接信息，供后续推理在历史裁剪后继续执行。
+     * @param stepKey 步骤稳定标识，同一标识更新原条目
+     * @param label 用户可读的步骤名称，空值沿用已有名称
+     * @param status 步骤状态，完成状态须覆盖该步骤要求的后续操作
+     * @param note 当前实际返回的业务标识、请求标识、已完成项及下一步
+     * @param ctx 当前工具执行上下文，用于限定会话范围
+     * @return 保存结果或明确的参数、存储错误
+     */
     @Tool(description = "Record or update a single step in the current conversation's progress "
         + "ledger. Use this to track multi-step tasks (research workflows, document drafting "
         + "split by section, etc.) — the runtime injects a rendered snapshot of the ledger "
@@ -38,6 +47,10 @@ public class ProgressLedgerTool {
         + "register pending entries up front when you decompose a task, mark in_progress "
         + "before starting each one, then done as soon as it lands. Re-using the same stepKey "
         + "overwrites the entry in place (no duplicates). "
+        + "After an operation returns identifiers needed by later steps, immediately record "
+        + "those exact identifiers, request ID, completed items and next action in note. "
+        + "Keep the step in_progress until its required follow-up work and submissions finish. "
+        + "A successful claim or creation alone does not complete the workflow. "
         + "IMPORTANT: do NOT use the `auto_` or `pin_` prefix in stepKey — those are reserved "
         + "for system-managed entries (auto-recorded tool completions and pinned skill "
         + "constraints) and will be rejected.")
@@ -52,8 +65,9 @@ public class ProgressLedgerTool {
             String label,
             @ToolParam(description = "One of: pending, in_progress, done, blocked.")
             String status,
-            @ToolParam(description = "Optional 1-line note (why it's blocked, what was produced, "
-                    + "next sub-step). Capped at ~120 chars when rendered into the snapshot.",
+            @ToolParam(description = "Optional handoff note: put exact identifiers and request ID first, "
+                    + "then completed items and next action. Active or blocked notes show up to 512 chars; "
+                    + "other states show up to 120 chars. Reuse known rules and tool schemas during the same task.",
                     required = false)
             String note,
             @Nullable ToolContext ctx) {

@@ -20,24 +20,9 @@ import java.util.concurrent.CancellationException;
 import static vip.mate.agent.graph.state.MateClawStateKeys.*;
 
 /**
- * Tool-execution node (the ReAct Action phase).
- * <p>
- * Delegates tool-call execution to {@link ToolExecutionExecutor}, supporting
- * concurrent execution and the approval barrier.
- * <p>
- * Supports the forced_replay phase: when an approved replay call arrives, it
- * skips the ToolGuard check and executes directly.
- *
- * <p>B2: when a {@code load_skill} call is detected, the skill manifest's
- * {@code constraints} are extracted and written to the ProgressLedger's pinned
- * entries, so the constraints stay visible for the whole conversation — never
- * overwritten by the LLM's progress_update, never trimmed by context compression.
- *
- * <p>B5: after a tool call succeeds, the ProgressLedger is auto-backfilled so the
- * LLM sees the completed tool-call record on the next turn even without calling
- * progress_update. Auto-recorded entries are capped
- * ({@link ProgressLedgerService#MAX_AUTO_RECORDED}) and never overwrite entries
- * the LLM already wrote.
+ * ReAct 工具执行节点，负责审批边界、一次批次执行及完成结果向运行状态的映射。
+ * <p>完成时在成员隔离目录保存原始回执并更新本轮索引，支持历史裁剪后的只读恢复。
+ * 同时将技能约束固定到进度账本，并补记成功调用，保持模型主动维护的业务步骤。</p>
  *
  * @author MateClaw Team
  */
@@ -96,6 +81,17 @@ public class ActionNode implements NodeAction {
     private vip.mate.skill.runtime.SkillRuntimeService skillRuntimeService;
     /** Optional — B2/B5: write pinned + auto-recorded entries. */
     private vip.mate.agent.progress.ProgressLedgerService progressLedgerService;
+
+    /** 保存本轮工具回执和恢复索引，沿用既有工作区隔离与文件清理。 */
+    private vip.mate.agent.graph.executor.ToolResultStorage toolResultStorage;
+
+    /**
+     * 注入回执存储，使已执行结果在模型历史裁剪后仍可读取。
+     * @param storage 工具结果存储
+     */
+    public void setToolResultStorage(vip.mate.agent.graph.executor.ToolResultStorage storage) {
+        this.toolResultStorage = storage;
+    }
 
     public ActionNode(ToolExecutionExecutor executor) {
         this(executor, null);
@@ -158,7 +154,12 @@ public class ActionNode implements NodeAction {
 
     }
 
-    /** Projects an already-executed result into business state without invoking tools. */
+    /**
+     * 将已经完成的工具批次映射为运行状态，保存原回执后再更新执行台账。
+     * @param state 当前运行状态，提供会话、工作区和原始调用关联
+     * @param result 已执行批次的响应与事件
+     * @return 下一阶段所需的状态增量；本方法不重复执行工具
+     */
     public Map<String, Object> completeBatch(RunState state,
                                             ToolExecutionExecutor.ToolExecutionResult result) {
         Objects.requireNonNull(result, "executed batch result");
@@ -175,14 +176,22 @@ public class ActionNode implements NodeAction {
         SourceEvidenceLedger rawLedger = result.rawEvidenceLedger() != null
                 ? result.rawEvidenceLedger()
                 : SourceEvidenceLedger.empty();
-        ActionExecutionLedger actionLedger = ActionExecutionLedger.fromEvents(result.events());
+        String workspaceBasePath = state.value(WORKSPACE_BASE_PATH, "");
+        if (vip.mate.workspace.core.service.MemberFileIsolation.isEnabled()) {
+            var scoped = vip.mate.workspace.core.service.MemberFileIsolation.scope(accessor.chatOrigin());
+            workspaceBasePath = scoped == null ? null : scoped.workspaceBasePath();
+        }
+        ActionExecutionLedger actionLedger = ActionExecutionLedger.fromEvents(result.events())
+                .preserveResults(result.events(), toolCalls, toolResultStorage, conversationId, workspaceBasePath);
+        ActionExecutionLedger mergedActionLedger = accessor.actionExecutionLedger().merge(actionLedger)
+                .preserveIndex(toolResultStorage, conversationId, workspaceBasePath);
         MateClawStateAccessor.OutputBuilder output = MateClawStateAccessor.output()
                 .toolResults(result.responses())
                 .messages(List.of((Message) toolResponseMessage))
                 .currentPhase("action")
                 .events(result.events())
                 .sourceEvidenceLedger(accessor.sourceEvidenceLedger().merge(rawLedger))
-                .actionExecutionLedger(accessor.actionExecutionLedger().merge(actionLedger));
+                .actionExecutionLedger(mergedActionLedger);
 
         if (result.awaitingApproval()) {
             output.awaitingApproval(true);

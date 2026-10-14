@@ -728,6 +728,12 @@ public class ReasoningNode implements NodeAction {
         this.progressLedgerService = null;
     }
 
+    /**
+     * 构建含执行回执恢复入口的模型上下文，并生成下一轮动作或答复。
+     * @param state 当前运行事实和会话上下文
+     * @return 下一阶段状态增量
+     * @throws Exception 模型调用或上下文准备失败
+     */
     @Override
     @SuppressWarnings("unchecked")
     public Map<String, Object> apply(RunState state) throws Exception {
@@ -944,21 +950,20 @@ public class ReasoningNode implements NodeAction {
         }
 
         if (conversationWindowManager != null) {
-            // Age-based compaction first: drop the body of tool responses
-            // older than the K most recent into a one-line placeholder that
-            // keeps the toolCallId / tool name (so the assistant/tool pair
-            // stays valid) and, for spilled bodies, preserves the on-disk
-            // path so read_file can still recover the original. Without
-            // this, even spilled previews (~1-2 KB each) accumulate across
-            // 30+ tool calls and bloat the prompt the model sees every turn.
+            // 按响应年龄压缩长正文前保存原文，短回执及调用关联保持完整。
+            String receiptWorkspace = workspaceBasePath;
+            if (vip.mate.workspace.core.service.MemberFileIsolation.isEnabled()) {
+                var scoped = vip.mate.workspace.core.service.MemberFileIsolation.scope(accessor.chatOrigin());
+                receiptWorkspace = scoped == null ? null : scoped.workspaceBasePath();
+            }
             messages = conversationWindowManager.compactAgedToolResponses(
-                    messages, KEEP_RECENT_TOOL_RESPONSES);
+                    messages, KEEP_RECENT_TOOL_RESPONSES, conversationId, receiptWorkspace);
             // Pass conversationId + workspaceBasePath so oversized older
             // tool results can be spilled to the workspace spill directory
             // (preserving the full body for read_file recovery) instead of
             // being rewritten into a lossy single-line summary.
             messages = conversationWindowManager.pruneOldToolResultsForModelInput(
-                    messages, conversationId, workspaceBasePath);
+                    messages, conversationId, receiptWorkspace);
         }
         List<Message> promptMessages = new ArrayList<>(nonHistoryPrefix);
         promptMessages.addAll(messages);

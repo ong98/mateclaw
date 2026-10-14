@@ -12,17 +12,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Pins {@link ConversationWindowManager#compactAgedToolResponses} — the
- * age-based pass that drops bodies of tool responses older than the K most
- * recent into a placeholder while preserving the toolCallId / tool name so
- * the model still sees "I called X earlier" in history. Complements (does
- * not replace) the existing size/dedup-based prune pass.
+ * 验证按消息年龄处理时保留短回执、调用关联和只读恢复路径。
  */
 class CompactAgedToolResponsesTest {
 
@@ -51,7 +45,8 @@ class CompactAgedToolResponsesTest {
     }
 
     @Test
-    @DisplayName("Latest K tool responses are kept verbatim; older ones get the placeholder.")
+    /** 短回执即使早于最近展示范围也完整保留。 */
+    @DisplayName("Short receipts remain verbatim beyond the latest K responses.")
     void keepsLatestKVerbatim() {
         String body = "abcdef".repeat(50);  // 300 chars — guaranteed larger than placeholder
         List<Message> in = new ArrayList<>();
@@ -62,15 +57,15 @@ class CompactAgedToolResponsesTest {
         // out[3] and out[4] are the two newest — verbatim.
         assertTrue(((ToolResponseMessage) out.get(3)).getResponses().get(0).responseData().contains("result-3"));
         assertTrue(((ToolResponseMessage) out.get(4)).getResponses().get(0).responseData().contains("result-4"));
-        // out[0..2] are older — compacted.
+        // 较早的短回执仍可直接读取。
         for (int i = 0; i <= 2; i++) {
             String compactedBody = ((ToolResponseMessage) out.get(i)).getResponses().get(0).responseData();
-            assertTrue(compactedBody.startsWith("[Old tool output cleared"),
-                    "expected placeholder at index " + i + ", got: " + compactedBody);
+            assertEquals("result-" + i + " " + body, compactedBody);
         }
     }
 
     @Test
+    /** 保真处理保持原调用标识和工具名称，缺少存储时保留正文。 */
     @DisplayName("Tool name and toolCallId survive the rewrite so the assistant/tool pair stays valid.")
     void preservesIdAndName() {
         String big = "a".repeat(500);
@@ -82,7 +77,7 @@ class CompactAgedToolResponsesTest {
         ToolResponseMessage.ToolResponse old = ((ToolResponseMessage) out.get(0)).getResponses().get(0);
         assertEquals("call-old", old.id());
         assertEquals("search", old.name());
-        assertNotEquals(big, old.responseData());
+        assertEquals(big, old.responseData());
         // Latest stays verbatim.
         assertEquals(big, ((ToolResponseMessage) out.get(2)).getResponses().get(0).responseData());
     }
@@ -102,6 +97,7 @@ class CompactAgedToolResponsesTest {
     }
 
     @Test
+    /** 豁免结果和无存储的普通回执均不被丢弃。 */
     @DisplayName("Exempt tools (delegateToAgent / delegateParallel) skip compaction entirely.")
     void exemptToolsSkipped() {
         String big = "x".repeat(500);
@@ -111,12 +107,12 @@ class CompactAgedToolResponsesTest {
                 toolResp("s-new", "search", big));
         List<Message> out = MANAGER.compactAgedToolResponses(in, 1);
         assertEquals(big, ((ToolResponseMessage) out.get(0)).getResponses().get(0).responseData());  // exempt
-        assertTrue(((ToolResponseMessage) out.get(1)).getResponses().get(0).responseData()
-                .startsWith("[Old tool output cleared"));  // non-exempt aged → compacted
+        assertEquals(big, ((ToolResponseMessage) out.get(1)).getResponses().get(0).responseData());
         assertEquals(big, ((ToolResponseMessage) out.get(2)).getResponses().get(0).responseData());  // newest kept
     }
 
     @Test
+    /** 极短回执直接保留，避免恢复标记增加模型正文。 */
     @DisplayName("A body shorter than the placeholder itself is kept verbatim — no negative savings.")
     void tinyBodyNotInflated() {
         List<Message> in = List.of(
@@ -139,20 +135,4 @@ class CompactAgedToolResponsesTest {
         assertSame(assistant, out.get(1));
     }
 
-    @Test
-    @DisplayName("buildAgedPlaceholder spill-path extraction handles trailing newline boundary.")
-    void buildPlaceholderSpillPath() {
-        String body = spillBody("browser_use", "/a/b/c.txt");
-        String out = ConversationWindowManager.buildAgedPlaceholder("browser_use", body);
-        assertNotNull(out);
-        assertTrue(out.contains("/a/b/c.txt"), out);
-    }
-
-    @Test
-    @DisplayName("buildAgedPlaceholder falls back to plain text when no spill path is present.")
-    void buildPlaceholderPlainBody() {
-        String out = ConversationWindowManager.buildAgedPlaceholder("search", "regular result body");
-        assertTrue(out.contains("'search'"), out);
-        assertTrue(out.contains("can be called again"), out);
-    }
 }

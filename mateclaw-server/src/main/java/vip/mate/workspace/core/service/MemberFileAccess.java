@@ -5,7 +5,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.*;
 import java.util.*;
 
-/** Descriptor-relative, no-follow host access. Never downgrades on unsupported filesystems. */
+/** 通过安全目录句柄读写成员文件，拒绝跟随链接；不支持安全句柄的文件系统不降级访问。 */
 public final class MemberFileAccess {
     private MemberFileAccess() { }
     public static byte[] read(Path root, Path file, int limit) throws IOException {
@@ -66,6 +66,23 @@ public final class MemberFileAccess {
                 } finally {
                     try { staging.deleteFile(temporary); } catch (NoSuchFileException moved) { }
                 }
+            }
+            return null;
+        });
+    }
+    /**
+     * 在成员目录内首次创建不可覆盖的回执文件，拒绝跟随链接或替换已有数据。
+     * @param root 已认证成员的文件根目录
+     * @param file 回执文件路径
+     * @param bytes 完整回执内容
+     * @throws IOException 文件已存在、路径不安全或写入失败
+     */
+    public static void writeNew(Path root, Path file, byte[] bytes) throws IOException {
+        withParent(root, file, true, (parent, name) -> {
+            try (var channel = parent.newByteChannel(name, Set.of(StandardOpenOption.WRITE,
+                    StandardOpenOption.CREATE_NEW, LinkOption.NOFOLLOW_LINKS))) {
+                ByteBuffer buffer = ByteBuffer.wrap(bytes);
+                while (buffer.hasRemaining()) channel.write(buffer);
             }
             return null;
         });

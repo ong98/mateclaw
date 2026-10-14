@@ -922,6 +922,7 @@ public class AgentGraphBuilder {
             // for tests that build ActionNode directly.
             actionNode.setSkillRuntimeService(skillRuntimeService);
             actionNode.setProgressLedgerService(progressLedgerService);
+            actionNode.setToolResultStorage(toolResultStorage);
             ObservationProcessor observationProcessor = new ObservationProcessor(graphObservationProperties);
             ObservationNode observationNode = new ObservationNode(observationProcessor, streamTracker);
             SummarizingNode summarizingNode = new SummarizingNode(chatModel, streamingHelper, streamTracker);

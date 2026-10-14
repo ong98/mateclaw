@@ -39,6 +39,9 @@ public final class ProgressLedger {
     /** Hard cap on the snapshot's note suffix so a rambling note can't bloat every turn. */
     private static final int NOTE_PREVIEW_CHARS = 120;
 
+    /** 进行中与受阻步骤保留较完整的交接信息，覆盖领取标识及下一步。 */
+    private static final int ACTIVE_NOTE_PREVIEW_CHARS = 512;
+
     /**
      * Key prefix for entries auto-recorded by ActionNode after successful
      * tool calls (B5). Lets the renderer group them into a separate
@@ -227,6 +230,7 @@ public final class ProgressLedger {
         return out;
     }
 
+    /** 按状态输出步骤，尚未完成的步骤优先保留执行标识和交接信息。 */
     private void appendBucket(StringBuilder sb, String header, Collection<ProgressEntry> items) {
         if (items.isEmpty()) {
             return;
@@ -237,8 +241,10 @@ public final class ProgressLedger {
             sb.append("- ").append(label).append(" [`").append(e.getKey()).append("`]");
             String note = e.getNote();
             if (note != null && !note.isBlank()) {
-                String trimmed = note.length() > NOTE_PREVIEW_CHARS
-                        ? note.substring(0, NOTE_PREVIEW_CHARS) + "…"
+                int limit = e.getStatus() == ProgressStatus.IN_PROGRESS || e.getStatus() == ProgressStatus.BLOCKED
+                        ? ACTIVE_NOTE_PREVIEW_CHARS : NOTE_PREVIEW_CHARS;
+                String trimmed = note.length() > limit
+                        ? note.substring(0, limit) + "…"
                         : note;
                 sb.append(" — ").append(trimmed);
             }

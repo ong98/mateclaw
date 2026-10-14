@@ -31,6 +31,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>
  * 四阶段压缩策略：
  * <ol>
+ *   <li>先保存可恢复的工具原文，短回执直接保留</li>
  *   <li>Soft Trim — 裁剪旧工具结果为 head+tail</li>
  *   <li>Hard Clear — 替换所有旧工具结果为占位符</li>
  *   <li>Pre-Prune — 喂给摘要 LLM 前清理工具输出（减少摘要输入 token）</li>
@@ -93,6 +94,9 @@ public class ConversationWindowManager {
      * size the dedup placeholder is a real win.
      */
     private static final int DEDUP_MIN_CHARS = 500;
+
+    /** 短回执直接保留，避免为少量业务标识引入恢复步骤。 */
+    private static final int SHORT_RECEIPT_CHARS = 512;
 
     /**
      * Tool names whose results must never be compacted into a one-line
@@ -407,6 +411,7 @@ public class ConversationWindowManager {
         }
     }
 
+    /** 在有损压缩前保存工具原文，再根据预算选择裁剪、记忆提取或结构化摘要。 */
     private List<Message> compactMessages(List<Message> messages, int historyBudget,
                                           int tailTokenBudget, ChatModel chatModel,
                                           String conversationId, Long agentId,
@@ -451,6 +456,15 @@ public class ConversationWindowManager {
         List<Message> oldMessages = new ArrayList<>(messages.subList(headEnd, tailStart));
         List<Message> recentMessages = messages.subList(tailStart, messages.size());
 
+        // 在任何有损裁剪前保存旧回执；落盘引用在后续阶段保持原样。
+        int preservedCount = spillEvictToolResults(oldMessages, conversationId, workspaceBasePath);
+        if (preservedCount > 0 && TokenEstimator.estimateTokens(oldMessages)
+                + TokenEstimator.estimateTokens(recentMessages) <= historyBudget) {
+            List<Message> result = new ArrayList<>(oldMessages);
+            result.addAll(recentMessages);
+            return result;
+        }
+
         // ═══ Phase 1: Soft Trim — 裁剪旧工具结果 ═══
         int softTrimmed = softTrimToolResults(oldMessages);
         if (softTrimmed > 0) {
@@ -488,36 +502,6 @@ public class ConversationWindowManager {
                 }
             } catch (Exception e) {
                 log.debug("[ConversationWindow] onPreCompress hook failed: {}", e.getMessage());
-            }
-        }
-
-        // ═══ Phase 2.7: Move 4 — Lossless spill evict ═══
-        // Before paying the LLM-summary cost (lossy + tokens + latency),
-        // try to bring oldMessages under budget by spilling remaining
-        // oversized tool results to disk. Each spilled result becomes a
-        // compact spill-marker (preview + on-disk path), recoverable via
-        // read_file. Exempt tools and already-spilled markers are skipped.
-        // If this phase lands the token count under historyBudget, the
-        // LLM summary is skipped entirely — the eviction is lossless.
-        if (toolResultStorage != null && workspaceBasePath != null) {
-            int spilled = spillEvictToolResults(oldMessages, conversationId, workspaceBasePath);
-            if (spilled > 0) {
-                int afterSpillTokens = TokenEstimator.estimateTokens(oldMessages)
-                        + TokenEstimator.estimateTokens(recentMessages);
-                log.info("[ConversationWindow] Phase 2.7 Spill evict: {} results spilled, tokens={}, budget={}",
-                        spilled, afterSpillTokens, historyBudget);
-                if (afterSpillTokens <= historyBudget) {
-                    List<Message> result = new ArrayList<>(oldMessages);
-                    result.addAll(recentMessages);
-                    broadcastCompactStatus(conversationId, "done", Map.of(
-                            "trigger", trigger,
-                            "preTokens", preTokens,
-                            "postTokens", afterSpillTokens,
-                            "strategy", "lossless_spill_evict",
-                            "resultsSpilled", spilled
-                    ));
-                    return result;
-                }
             }
         }
 
@@ -894,35 +878,12 @@ public class ConversationWindowManager {
     }
 
     /**
-     * Walk the messages newest-to-oldest, keeping the latest tool response
-     * verbatim and applying space-saving rewrites to older ones:
-     *
-     * <ol>
-     *   <li>Bodies already starting with {@link ToolResultStorage#SPILL_MARKER_PREFIX}
-     *       were spilled at tool-execution time — pass through untouched.</li>
-     *   <li>If a body matches an identical body already seen in a newer turn,
-     *       replace it with a short "duplicate tool output omitted" placeholder
-     *       (only above {@link #DEDUP_MIN_CHARS} so we don't bloat tiny acks).</li>
-     *   <li>Otherwise, when a {@link ToolResultStorage} is wired and a
-     *       conversation id is available, try
-     *       {@link ToolResultStorage#persistIfOversized} to spill the raw
-     *       bytes to disk and replace the inline body with a preview + path
-     *       so the model can read_file the original on demand.</li>
-     *   <li>If none of the above apply, leave the body verbatim. Bodies
-     *       under the spill threshold or running without a storage hook are
-     *       preserved exactly — the lossy "summarized for model context"
-     *       single-liner that used to fire here destroyed enough context
-     *       on long tasks to be the wrong default.</li>
-     * </ol>
-     *
-     * <p>The {@link #PRUNE_EXEMPT_TOOLS} set still bypasses everything:
-     * sub-agent delegations are not replayable, so their full transcript
-     * stays in context.
-     *
-     * @param messages          full conversation in chronological order
-     * @param conversationId    used to scope spill files; {@code null} disables spill
-     * @param workspaceBasePath used to locate the spill directory; {@code null}
-     *                          falls back through the storage's resolveBaseDir chain
+     * 保留最新结果，旧长输出先按原文去重或落盘，短回执保持完整。
+     * 豁免工具和已有落盘引用不被改写；存储失败时保留原正文。
+     * @param messages 按时间排列的会话消息
+     * @param conversationId 当前会话标识；缺少时不落盘
+     * @param workspaceBasePath 当前隔离工作区目录
+     * @return 处理后的消息；没有变化时返回原列表
      */
     public List<Message> pruneOldToolResultsForModelInput(List<Message> messages,
                                                           String conversationId,
@@ -973,7 +934,7 @@ public class ConversationWindowManager {
                 }
 
                 // Dedup: identical body seen in a later turn already.
-                if (data.length() > DEDUP_MIN_CHARS && seenLargeOutputs.contains(data)) {
+                if (data.length() > Math.max(DEDUP_MIN_CHARS, SHORT_RECEIPT_CHARS) && seenLargeOutputs.contains(data)) {
                     String replacement = "[" + name
                             + "] duplicate tool output omitted; same content appeared later.";
                     newResponses.add(new ToolResponseMessage.ToolResponse(r.id(), name, replacement));
@@ -1048,27 +1009,25 @@ public class ConversationWindowManager {
     }
 
     /**
-     * Age-based compaction. Replace bodies of all tool responses older than
-     * the {@code keepRecentN} most recent with a one-line placeholder, while
-     * preserving the toolCallId and tool name so the assistant/tool pairing
-     * remains valid and the model still sees "I called X earlier" in history.
-     *
-     * <p>Complementary to {@link #pruneOldToolResultsForModelInput}: that pass
-     * targets oversized or duplicate bodies regardless of age (and may spill
-     * to disk); this one targets aged bodies regardless of size. Both can run
-     * in any order — the intersection collapses to the same placeholder.
-     *
-     * <p>Spill-marker bodies retain their on-disk {@code path=} pointer
-     * inside the placeholder so a later {@code read_file} can still recover
-     * the original output. {@link #PRUNE_EXEMPT_TOOLS} (sub-agent delegations)
-     * bypass the pass entirely — their transcripts are not replayable.
-     *
-     * @param messages     full conversation in chronological order
-     * @param keepRecentN  number of newest {@link ToolResponseMessage}s kept
-     *                     verbatim; older ones are compacted. Negative or zero
-     *                     disables the pass.
+     * 保留短回执及缺少存储上下文的旧响应，不通过重新执行工具恢复信息。
+     * @param messages 按时间排列的消息
+     * @param keepRecentN 保留完整正文的最近工具响应数；非正数关闭压缩
+     * @return 保真处理后的消息
      */
     public List<Message> compactAgedToolResponses(List<Message> messages, int keepRecentN) {
+        return compactAgedToolResponses(messages, keepRecentN, null, null);
+    }
+
+    /**
+     * 压缩较早的大段响应时先保存原文，仅用可读取的文件引用替换正文。
+     * @param messages 按时间排列的消息
+     * @param keepRecentN 保留完整正文的最近工具响应数
+     * @param conversationId 当前会话，用于限定回执存储范围
+     * @param workspaceBasePath 当前工作区隔离目录
+     * @return 压缩后的消息；保存失败时保留对应原文
+     */
+    public List<Message> compactAgedToolResponses(List<Message> messages, int keepRecentN,
+                                                 String conversationId, String workspaceBasePath) {
         if (messages == null || messages.isEmpty() || keepRecentN <= 0) {
             return messages;
         }
@@ -1093,11 +1052,13 @@ public class ConversationWindowManager {
                 String body = r.responseData();
                 String name = r.name();
                 boolean exempt = name != null && PRUNE_EXEMPT_TOOLS.contains(name);
-                if (exempt || body == null || body.isEmpty()) {
+                if (exempt || body == null || body.length() <= SHORT_RECEIPT_CHARS
+                        || isSpillMarker(r) || toolResultStorage == null) {
                     newResponses.add(r);
                     continue;
                 }
-                String placeholder = buildAgedPlaceholder(name, body);
+                String placeholder = toolResultStorage.compactForRecovery(body, name, r.id(),
+                        conversationId, workspaceBasePath);
                 if (placeholder.length() < body.length()) {
                     newResponses.add(new ToolResponseMessage.ToolResponse(r.id(), name, placeholder));
                     messageChanged = true;
@@ -1121,33 +1082,10 @@ public class ConversationWindowManager {
     }
 
     /**
-     * Build the one-line "old tool output cleared" body. When the original
-     * was a spill marker, extract its {@code path=} hint so the model can
-     * still recover the full output via {@code read_file} on demand.
-     */
-    static String buildAgedPlaceholder(String toolName, String body) {
-        String safeName = (toolName == null || toolName.isBlank()) ? "tool" : toolName;
-        if (body != null && body.startsWith(ToolResultStorage.SPILL_MARKER_PREFIX)) {
-            int idx = body.indexOf(" path=");
-            if (idx >= 0) {
-                int end = body.indexOf('\n', idx);
-                String path = (end > 0 ? body.substring(idx + 6, end) : body.substring(idx + 6)).trim();
-                if (!path.isEmpty()) {
-                    return "[Old tool output cleared — '" + safeName
-                            + "' result was spilled to " + path
-                            + "; use read_file on that path if you still need it.]";
-                }
-            }
-        }
-        return "[Old tool output cleared — '" + safeName
-                + "' can be called again if its result is needed.]";
-    }
-
-    /**
-     * One-line informative summary for a cleared tool result: tool name,
-     * original size, and the first line as a gist. Far more useful to the
-     * model than a bare "removed" marker — it can decide whether re-running
-     * the tool is worth it without guessing what the output was.
+     * 生成有界摘要，说明原正文大小和读取回执的恢复入口。
+     * @param toolName 原始工具名称
+     * @param body 当前工具正文
+     * @return 包含首行预览的恢复说明
      */
     static String buildInformativeCleared(String toolName, String body) {
         String safeName = (toolName == null || toolName.isBlank()) ? "tool" : toolName;
@@ -1167,13 +1105,13 @@ public class ConversationWindowManager {
         if (!gist.isEmpty()) {
             sb.append("; began: \"").append(gist).append('"');
         }
-        return sb.append("; call the tool again if the result is still needed]").toString();
+        return sb.append("; retrieve the original receipt through its recovery index]").toString();
     }
 
     /**
-     * Phase 1 - Soft trim：对工具结果做 head+tail 裁剪（保留首尾各 200 字符）。
-     * <p>Spill-marker responses are left untouched so their on-disk pointer
-     * survives intact across compaction.
+     * 软裁剪长正文首尾，保留短回执、豁免结果和原文文件引用。
+     * @param messages 原地处理的旧消息
+     * @return 实际裁剪的消息数
      */
     int softTrimToolResults(List<Message> messages) {
         int trimmed = 0;
@@ -1187,14 +1125,14 @@ public class ConversationWindowManager {
                         newResponses.add(r);
                         continue;
                     }
-                    if (isExemptTool(r)) {
+                    if (isExemptTool(r) || mustKeepUnstoredReceipt(r)) {
                         // Move 4: load_skill / delegateToAgent outputs are not
                         // safely recoverable — pass through verbatim.
                         newResponses.add(r);
                         continue;
                     }
                     String data = r.responseData();
-                    if (data != null && data.length() > 500) {
+                    if (data != null && data.length() > SHORT_RECEIPT_CHARS) {
                         String marker = "\n...[trimmed " + data.length() + " chars; "
                                 + StructuredTruncator.FIDELITY_NOTE + "]...\n";
                         newResponses.add(new ToolResponseMessage.ToolResponse(
@@ -1214,10 +1152,9 @@ public class ConversationWindowManager {
     }
 
     /**
-     * Phase 2 - Hard clear：将所有旧工具结果替换为占位符。
-     * <p>Spill-marker responses are left untouched so the on-disk pointer
-     * survives — a placeholder here would force the model to abandon a
-     * tool output it could otherwise recover via {@code read_file}.
+     * 清理旧长正文，保留短回执及原文文件引用。
+     * @param messages 原地处理的旧消息
+     * @return 实际清理的消息数
      */
     int hardClearToolResults(List<Message> messages) {
         int cleared = 0;
@@ -1230,8 +1167,12 @@ public class ConversationWindowManager {
                         replaced.add(r);
                         continue;
                     }
-                    if (isExemptTool(r)) {
+                    if (isExemptTool(r) || mustKeepUnstoredReceipt(r)) {
                         // Move 4: exempt tools survive Phase 2 unchanged.
+                        replaced.add(r);
+                        continue;
+                    }
+                    if (r.responseData() == null || r.responseData().length() <= SHORT_RECEIPT_CHARS) {
                         replaced.add(r);
                         continue;
                     }
@@ -1249,9 +1190,9 @@ public class ConversationWindowManager {
     }
 
     /**
-     * Phase 3 Pre-prune：在 LLM 摘要前，将工具输出替换为占位符（减少摘要输入 token）。
-     * <p>Spill-marker responses are left untouched so the summary input
-     * still has the on-disk path the model might cite back in its summary.
+     * 摘要前减少长正文，保留办理短回执、豁免结果和恢复路径。
+     * @param messages 原地处理的摘要输入消息
+     * @return 实际处理的消息数
      */
     int prePruneForSummary(List<Message> messages) {
         int pruned = 0;
@@ -1263,8 +1204,9 @@ public class ConversationWindowManager {
                 boolean hasSubstantial = trm.getResponses().stream()
                         .anyMatch(r -> !isSpillMarker(r)
                                 && !isExemptTool(r)
+                                && !mustKeepUnstoredReceipt(r)
                                 && r.responseData() != null
-                                && r.responseData().length() > 200);
+                                && r.responseData().length() > SHORT_RECEIPT_CHARS);
                 if (hasSubstantial) {
                     List<ToolResponseMessage.ToolResponse> placeholders = new ArrayList<>(trm.getResponses().size());
                     for (ToolResponseMessage.ToolResponse r : trm.getResponses()) {
@@ -1272,13 +1214,17 @@ public class ConversationWindowManager {
                             placeholders.add(r);
                             continue;
                         }
-                        if (isExemptTool(r)) {
+                        if (isExemptTool(r) || mustKeepUnstoredReceipt(r)) {
                             // Move 4: exempt tools survive Phase 3 pre-prune.
                             placeholders.add(r);
                             continue;
                         }
+                        if (r.responseData() == null || r.responseData().length() <= SHORT_RECEIPT_CHARS) {
+                            placeholders.add(r);
+                            continue;
+                        }
                         placeholders.add(new ToolResponseMessage.ToolResponse(r.id(), r.name(),
-                                "[旧工具输出已清理以节省上下文空间]"));
+                                buildInformativeCleared(r.name(), r.responseData())));
                     }
                     messages.set(i, ToolResponseMessage.builder().responses(placeholders).build());
                     pruned++;
@@ -1289,30 +1235,20 @@ public class ConversationWindowManager {
     }
 
     /**
-     * Move 4 — Phase 2.7 lossless spill evict. Walks {@code messages} and
-     * spills each non-exempt, non-spilled, oversized tool result to disk via
-     * {@link ToolResultStorage#persistIfOversized}, replacing the body with
-     * a compact spill marker (preview + on-disk path). The model can recover
-     * the original via {@code read_file} on the path.
-     *
-     * <p>Unlike Phase 1/2 (which trim/clear in place), this phase is
-     * <em>lossless</em>: the full output is preserved on disk. The token
-     * savings come from replacing a multi-KB body with a ~200-char preview.
-     * When the savings are enough to land under {@code historyBudget}, the
-     * caller skips the LLM summary entirely — avoiding its token cost,
-     * latency, and lossy compression.
-     *
-     * <p>Skips:
-     * <ul>
-     *   <li>Exempt tools ({@link #PRUNE_EXEMPT_TOOLS}) — not safely
-     *       recoverable.</li>
-     *   <li>Already-spilled markers — re-spilling would just overwrite the
-     *       same file.</li>
-     *   <li>Bodies under {@code perResultThresholdChars} — too small to
-     *       benefit from spilling (the marker preview is comparable in size).</li>
-     * </ul>
-     *
-     * @return number of tool responses actually spilled to disk
+     * 保留未落盘的业务回执；读取类工具可以通过原始文件入口重新读取。
+     * @param response 当前仍内联的结果
+     * @return 已配置存储时是否必须保留尚未获得文件引用的回执
+     */
+    private boolean mustKeepUnstoredReceipt(ToolResponseMessage.ToolResponse response) {
+        return toolResultStorage != null && !toolResultStorage.isRetrievalExcluded(response.name());
+    }
+
+    /**
+     * 压缩旧长结果前保存原文，用紧凑引用替换正文；短回执和豁免工具保持原样。
+     * @param messages 原地处理的旧消息
+     * @param conversationId 回执所属会话
+     * @param workspaceBasePath 当前隔离工作区
+     * @return 实际替换为可读引用的结果数
      */
     int spillEvictToolResults(List<Message> messages, String conversationId,
                               String workspaceBasePath) {
@@ -1334,10 +1270,14 @@ public class ConversationWindowManager {
                     newResponses.add(r);
                     continue;
                 }
-                String spilledBody = toolResultStorage.persistIfOversized(
+                if (data.length() <= SHORT_RECEIPT_CHARS) {
+                    newResponses.add(r);
+                    continue;
+                }
+                String spilledBody = toolResultStorage.compactForRecovery(
                         data, r.name(), r.id(), conversationId, workspaceBasePath);
                 if (spilledBody != data) {
-                    // persistIfOversized replaced the body with a spill marker
+                    // 已保存完整原文，仅将模型正文替换为可读引用。
                     newResponses.add(new ToolResponseMessage.ToolResponse(
                             r.id(), r.name(), spilledBody));
                     changed = true;

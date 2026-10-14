@@ -13,10 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Pins {@link ProgressLedger#renderSnapshot} — the exact string the runtime
- * splices into the system prompt before each LLM call. Order of the buckets
- * and the per-entry shape are part of the contract; the agent is going to
- * parse this text every turn.
+ * 验证模型每轮可见的进度快照，确保尚未完成的步骤保留关键交接信息。
  */
 class ProgressLedgerSnapshotTest {
 
@@ -99,5 +96,15 @@ class ProgressLedgerSnapshotTest {
 
     private static ProgressEntry entry(String key, String label, ProgressStatus status, String note) {
         return new ProgressEntry(key, label, status, note, Instant.now());
+    }
+
+    /** 进行中和受阻的步骤保留超过旧一百二十字符上限的关键交接信息。 */
+    @Test
+    void activeStepsKeepClaimIdentifiersAndNextAction() {
+        String note = "已完成证据核验；".repeat(25) + "detailId=7118,7119; requestId=original; 下一步提交两项";
+        for (var status : new ProgressStatus[]{ProgressStatus.IN_PROGRESS, ProgressStatus.BLOCKED}) {
+            var ledger = new ProgressLedger(Map.of("audit", entry("audit", "本批审核", status, note)));
+            assertTrue(ledger.renderSnapshot().contains(note));
+        }
     }
 }

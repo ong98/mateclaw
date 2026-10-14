@@ -13,16 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The three compaction phases (soft trim, hard clear, pre-prune for
- * summary) must never destroy a spill-marker body — doing so would erase
- * the {@code path=...} pointer the model needs to recover the original
- * full output via {@code read_file}, which is the whole reason that body
- * was spilled in the first place.
- *
- * <p>This is the "recoverable" invariant: once a tool output makes it
- * into the spill store, the in-context representation stays a stable
- * preview + path for the rest of the conversation regardless of how
- * aggressively the window manager has to compress the prefix.
+ * 验证软裁剪、清理和摘要预处理始终保留原文文件路径，便于只读恢复。
  */
 class ConversationWindowManagerSpillMarkerPreservationTest {
 
@@ -82,6 +73,7 @@ class ConversationWindowManagerSpillMarkerPreservationTest {
     }
 
     @Test
+    /** 摘要输入保留落盘标记，普通长输出提示从回执索引恢复。 */
     void prePruneForSummaryLeavesSpillMarkerUntouched() {
         ConversationWindowManager mgr = new ConversationWindowManager(
                 new ConversationWindowProperties(), null, null);
@@ -97,7 +89,7 @@ class ConversationWindowManagerSpillMarkerPreservationTest {
         ToolResponseMessage trm1 = (ToolResponseMessage) messages.get(1);
         assertEquals(SPILL_BODY, trm0.getResponses().getFirst().responseData(),
                 "Phase 3 pre-prune must not replace a spill-marker body with the cleared-output placeholder");
-        assertTrue(trm1.getResponses().getFirst().responseData().contains("旧工具输出已清理"),
+        assertTrue(trm1.getResponses().getFirst().responseData().contains("recovery index"),
                 "non-spill bodies should still be replaced by Phase 3");
         assertEquals(1, pruned);
     }

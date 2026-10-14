@@ -21,31 +21,10 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * Tool-result spill store implementing layers 2 and 3 of the RFC-008 Phase 3
- * three-layer budget. Layer 1 (per-tool cap) lives inside individual tools.
- *
- * <p><b>Layer 2 — per-result spill</b> ({@link #persistIfOversized}): a single
- * tool result that exceeds the configured threshold is written to disk and
- * the in-memory copy is replaced with a short preview plus a pointer line so
- * the LLM can use {@code read_file} to retrieve the full text on demand.</p>
- *
- * <p><b>Layer 3 — per-turn aggregate budget</b>
- * ({@link #enforceTurnBudget}): after every tool in one turn has executed,
- * if the combined response size still exceeds the turn budget, the largest
- * non-spilled responses are spilled in turn until the aggregate fits.</p>
- *
- * <p>Spill files live under one of, in order:</p>
- * <ol>
- *   <li>{@code ToolResultProperties.storageBaseDir} when explicitly set</li>
- *   <li>{@code <workspaceBasePath>/.mateclaw/tool-results/<conversationId>/} when a workspace is bound</li>
- *   <li>{@code ${java.io.tmpdir}/mateclaw/tool-results/<conversationId>/} as the universal fallback</li>
- * </ol>
- *
- * <p>Failures (disk full, IO error) degrade silently: the original result is
- * returned unchanged so the agent keeps working. Errors are logged at WARN.</p>
- *
- * <p>This class does <b>not</b> manage GC. Spill files accumulate until manually
- * cleaned. A scheduled cleanup job is tracked as a Phase 3 follow-up.</p>
+ * 通用工具结果存储，按单结果和批次预算落盘，并为旧回执提供只读恢复入口。
+ * <p>同一调用的原文首次保存后不可被裁剪正文覆盖；本轮回执索引随实际完成批次更新。
+ * 成员隔离开启时只使用已认证成员目录，否则依次使用配置目录、工作区或临时目录。
+ * 保存失败时保留调用原文；回执和索引复用已有会话删除及保留期清理机制。</p>
  */
 @Slf4j
 @Component
@@ -175,6 +154,100 @@ public class ToolResultStorage {
         long count = spillCount.incrementAndGet();
         log.info("[ToolResultStorage] spill #{}: tool={} chars={} convId={}", count, toolName, result.length(), conversationId);
         return buildPreview(result, toolName, file);
+    }
+
+    /**
+     * 保存工具原始回执，供上下文压缩后的只读恢复；读取工具沿用原文件入口。
+     * 已落盘结果直接复用引用，不把预览覆盖到原始文件中。
+     *
+     * @param result 本次调用返回的完整正文或已有落盘标记
+     * @param toolName 实际执行的工具名称
+     * @param toolUseId 本次工具调用标识
+     * @param conversationId 回执所属会话
+     * @param workspaceBasePath 当前工作区隔离目录
+     * @return 原文绝对路径；存储关闭、读取工具或保存失败时返回 {@code null}
+     */
+    public String preserveForRecovery(String result, String toolName, String toolUseId,
+                                      String conversationId, String workspaceBasePath) {
+        if (!props.isEnabled() || result == null || conversationId == null || conversationId.isBlank()
+                || toolUseId == null || toolUseId.isBlank() || isExcluded(toolName)) return null;
+        String existing = spillPath(result);
+        if (existing != null) return existing;
+        Path file = spillFor(conversationId, toolUseId, workspaceBasePath);
+        if (file == null) return null;
+        try {
+            writeSpill(file, result, workspaceBasePath);
+            return file.toAbsolutePath().toString();
+        } catch (IOException | RuntimeException ex) {
+            log.warn("[ToolResultStorage] receipt write failed for tool={} convId={}: {}",
+                    toolName, conversationId, ex.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 更新本轮回执索引，让超出最近展示范围的调用仍可按调用标识找回。
+     *
+     * @param index 本轮回执的 JSON 索引，不包含大段原文
+     * @param runKey 本轮首条调用标识，用于区分同一会话中的不同执行轮次
+     * @param conversationId 索引所属会话
+     * @param workspaceBasePath 当前工作区隔离目录
+     * @return 索引绝对路径；保存失败时返回 {@code null}
+     */
+    public String preserveRecoveryIndex(String index, String runKey, String conversationId,
+                                         String workspaceBasePath) {
+        if (!props.isEnabled() || conversationId == null || conversationId.isBlank()
+                || runKey == null || runKey.isBlank()) return null;
+        Path file = spillFor(conversationId, "receipt-index-" + runKey, workspaceBasePath);
+        if (file == null) return null;
+        try {
+            if (MemberFileIsolation.isEnabled()) {
+                vip.mate.workspace.core.service.MemberFileAccess.write(Path.of(workspaceBasePath),
+                        file, index.getBytes(StandardCharsets.UTF_8), false);
+            } else {
+                Files.createDirectories(file.getParent());
+                Files.writeString(file, index, StandardCharsets.UTF_8);
+            }
+            return file.toAbsolutePath().toString();
+        } catch (IOException | RuntimeException ex) {
+            log.warn("[ToolResultStorage] receipt index write failed for convId={}: {}", conversationId, ex.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 从落盘标记读取原文路径，保留包含空格的完整路径。
+     *
+     * @param result 工具结果正文
+     * @return 标记中的原文路径；普通结果或标记缺少路径时返回 {@code null}
+     */
+    public static String spillPath(String result) {
+        if (result == null || !result.startsWith(SPILL_MARKER_PREFIX)) return null;
+        int start = result.indexOf(" path=");
+        if (start < 0) return null;
+        int end = result.indexOf('\n', start);
+        String path = (end < 0 ? result.substring(start + 6) : result.substring(start + 6, end)).trim();
+        return path.isEmpty() ? null : path;
+    }
+
+    /**
+     * 将旧工具正文替换为紧凑的只读恢复引用；保存失败时保留原文。
+     *
+     * @param result 当前尚未裁剪的工具正文
+     * @param toolName 实际工具名称
+     * @param toolUseId 工具调用标识
+     * @param conversationId 当前会话
+     * @param workspaceBasePath 当前工作区隔离目录
+     * @return 原文恢复标记，或无法保存时的原始正文
+     */
+    public String compactForRecovery(String result, String toolName, String toolUseId,
+                                      String conversationId, String workspaceBasePath) {
+        if (spillPath(result) != null) return result;
+        String path = preserveForRecovery(result, toolName, toolUseId, conversationId, workspaceBasePath);
+        if (path == null) return result;
+        String reference = SPILL_MARKER_PREFIX + " tool=" + toolName + " full_chars=" + result.length()
+                + " path=" + path + "\n原始回执已保存；需要原文时用 read_file 读取该路径。";
+        return reference.length() < result.length() ? reference : result;
     }
 
     /**
@@ -308,15 +381,23 @@ public class ToolResultStorage {
     }
 
     /**
-     * Resolve the spill file path for a given (conversationId, toolUseId).
-     * Returns {@code null} if no usable directory can be determined.
+     * 首次写入调用原文，重复压缩复用已有文件，避免将裁剪正文覆盖到完整回执。
+     * @param file 当前调用的存储路径
+     * @param text 尚未裁剪的正文
+     * @param workspaceBasePath 当前成员隔离目录
+     * @throws IOException 原文无法保存且不是已有回执
      */
     private void writeSpill(Path file, String text, String workspaceBasePath) throws IOException {
-        if (MemberFileIsolation.isEnabled()) {
-            vip.mate.workspace.core.service.MemberFileAccess.write(Path.of(workspaceBasePath), file, text.getBytes(StandardCharsets.UTF_8), false);
-        } else {
-            Files.createDirectories(file.getParent());
-            Files.writeString(file, text, StandardCharsets.UTF_8);
+        try {
+            if (MemberFileIsolation.isEnabled()) {
+                vip.mate.workspace.core.service.MemberFileAccess.writeNew(Path.of(workspaceBasePath), file, text.getBytes(StandardCharsets.UTF_8));
+            } else {
+                Files.createDirectories(file.getParent());
+                Files.writeString(file, text, StandardCharsets.UTF_8, java.nio.file.StandardOpenOption.CREATE_NEW);
+            }
+        } catch (java.nio.file.FileAlreadyExistsException existingReceipt) {
+            if (MemberFileIsolation.isEnabled()) MemberFileIsolation.validate(Path.of(workspaceBasePath), file.toString());
+            if (!Files.isRegularFile(file, java.nio.file.LinkOption.NOFOLLOW_LINKS)) throw existingReceipt;
         }
     }
 
