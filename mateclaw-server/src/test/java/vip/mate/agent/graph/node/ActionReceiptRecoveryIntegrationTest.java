@@ -31,6 +31,27 @@ import static vip.mate.agent.graph.state.MateClawStateKeys.*;
 
 /** 用真实执行节点、执行器和文件读取工具验证领取后长链路的恢复与提交。 */
 class ActionReceiptRecoveryIntegrationTest {
+    /** 部分批次因审批暂停时，仅真实完成事件可以清除对应的待确认调用。 */
+    @Test
+    void checkpointKeepsApprovalAndUnexecutedCalls(@TempDir Path directory) throws Exception {
+        var origin = ChatOrigin.web("receipt-conversation", "user", 1L, directory.toString()).withOriginMessageId(1L);
+        var state = state(directory);
+        state.replace(CHAT_ORIGIN, origin);
+        state.replace(TOOL_CALLS, List.of(
+                new AssistantMessage.ToolCall("finished", "function", "read_evidence", "{}"),
+                new AssistantMessage.ToolCall("approval", "function", "write_file", "{}"),
+                new AssistantMessage.ToolCall("later", "function", "query_data", "{}")));
+        var node = new ActionNode(null);
+        node.completeBatch(state, new ToolExecutionExecutor.ToolExecutionResult(List.of(),
+                List.of(vip.mate.agent.GraphEventPublisher.toolComplete("finished", "read_evidence", "证据", true)),
+                true, "pending-1", "write_file"));
+        var checkpoint = new ObjectMapper().readTree(java.nio.file.Files.readString(
+                vip.mate.agent.context.RuntimeArtifacts.directory(origin).getParent().resolve("checkpoint.json")));
+        assertEquals(2, checkpoint.path("unconfirmedCalls").size());
+        assertEquals("approval", checkpoint.path("unconfirmedCalls").get(0).path("toolCallId").asText());
+        assertEquals("later", checkpoint.path("unconfirmedCalls").get(1).path("toolCallId").asText());
+    }
+
     /** 领取退出最近二十四条正文且消息被裁剪后，仍从索引恢复两项并各提交一次。 */
     @Test
     void recoverAfterThirtyEvidenceCallsAndSubmitWithoutReclaim(@TempDir Path directory) throws Exception {
@@ -56,7 +77,7 @@ class ActionReceiptRecoveryIntegrationTest {
         var manager = new ConversationWindowManager(new ConversationWindowProperties(), null, null);
         state.replace(MESSAGES, manager.compactForRetry(state.value(MESSAGES, List.of())));
         var index = new ObjectMapper().readTree(read(indexPath(facts)));
-        var claim = index.path("receipts").get(0);
+        var claim = index.path("receipts").get(index.path("receipts").size() - 1);
         assertEquals(31, index.path("receipts").size());
         assertEquals("claim-original", claim.path("toolCallId").asText());
         assertTrue(claim.path("argumentsPreview").asText().contains("original-request"));
@@ -166,8 +187,9 @@ class ActionReceiptRecoveryIntegrationTest {
         var result = new ObjectMapper().readTree(tool.read_file(path, null, null, null, null));
         assertFalse(result.path("error").asBoolean(), result.toString());
         assertFalse(result.path("truncated").asBoolean(), result.toString());
-        String content = result.path("content").asText();
-        return content.substring(content.indexOf('{')).strip();
+        return result.path("content").asText().lines()
+                .map(line -> line.replaceFirst("^\\s*\\d+\\t", ""))
+                .collect(java.util.stream.Collectors.joining("\n")).strip();
     }
 
     /** 构造有计数和输入校验的业务回调，不访问生产质检服务。 */

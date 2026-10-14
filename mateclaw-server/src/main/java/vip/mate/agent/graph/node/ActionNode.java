@@ -118,7 +118,12 @@ public class ActionNode implements NodeAction {
         return completeBatch(state, executeBatch(state));
     }
 
-    /** Executes the guarded batch once; runtime orchestration retains the returned result. */
+    /**
+     * 执行经守卫校验的工具批次，执行前保存待确认标识，运行时持有真实返回结果。
+     * @param state 当前会话、成员来源及待执行调用
+     * @return 本批真实工具响应与完成事件，不自动重放历史调用
+     * @throws Exception 用户停止执行或工具批次无法完成
+     */
     public ToolExecutionExecutor.ToolExecutionResult executeBatch(RunState state) throws Exception {
         List<AssistantMessage.ToolCall> toolCalls = state.<List<AssistantMessage.ToolCall>>value(TOOL_CALLS)
                 .orElse(List.of());
@@ -146,6 +151,9 @@ public class ActionNode implements NodeAction {
         // RFC-063r §2.5: read the originating ChatOrigin from graph state and
         // forward it into the executor — tools see it via Spring AI ToolContext.
         vip.mate.agent.context.ChatOrigin origin = accessor.chatOrigin();
+
+        saveCheckpoint(accessor, vip.mate.workspace.core.service.MemberFileIsolation.scope(origin),
+                accessor.actionExecutionLedger(), toolCalls);
 
         // 委托 ToolExecutionExecutor 执行（两阶段：顺序 Guard + 分段并发执行）
         return executor.execute(
@@ -183,6 +191,7 @@ public class ActionNode implements NodeAction {
         }
         ActionExecutionLedger actionLedger = ActionExecutionLedger.fromEvents(result.events())
                 .preserveResults(result.events(), toolCalls, toolResultStorage, conversationId, workspaceBasePath);
+        toolResponseMessage = vip.mate.agent.context.ToolResponseIdentity.attach(toolResponseMessage, actionLedger);
         ActionExecutionLedger mergedActionLedger = accessor.actionExecutionLedger().merge(actionLedger)
                 .preserveIndex(toolResultStorage, conversationId, workspaceBasePath);
         MateClawStateAccessor.OutputBuilder output = MateClawStateAccessor.output()
@@ -250,7 +259,24 @@ public class ActionNode implements NodeAction {
         // doesn't overwrite LLM-authored entries.
         autoRecordToolCalls(conversationId, result.responses(), actionLedger);
 
+        saveCheckpoint(accessor, vip.mate.workspace.core.service.MemberFileIsolation.scope(accessor.chatOrigin()),
+                mergedActionLedger, toolCalls.stream()
+                        .filter(call -> !actionLedger.receipts().containsKey(call.id())).toList());
+
         return output.build();
+    }
+
+    /** 保存有界目标、工作集与真实回执引用，存储失败明确记录但不重执行已经完成的工具。 */
+    private void saveCheckpoint(MateClawStateAccessor accessor, vip.mate.agent.context.ChatOrigin origin,
+                                ActionExecutionLedger ledger, List<AssistantMessage.ToolCall> pending) {
+        try {
+            String workingSet = progressLedgerService == null ? ""
+                    : progressLedgerService.load(accessor.conversationId()).renderSnapshot(2000);
+            String index = ledger.recoveryIndexPath();
+            vip.mate.agent.context.RuntimeCheckpoint.save(origin, accessor.userMessage(), workingSet, index, pending);
+        } catch (Exception ex) {
+            log.warn("[ActionNode] checkpoint unavailable for conv={}: {}", accessor.conversationId(), ex.getMessage());
+        }
     }
 
     // ==================== B2: Pin skill constraints ====================
@@ -354,6 +380,7 @@ public class ActionNode implements NodeAction {
         autoRecordToolCalls(conversationId, responses, null);
     }
 
+    /** 根据真实执行台账登记成功调用，桥接协议名不作为进度归档键。 */
     void autoRecordToolCalls(String conversationId,
                              List<ToolResponseMessage.ToolResponse> responses,
                              ActionExecutionLedger executionLedger) {
@@ -371,7 +398,8 @@ public class ActionNode implements NodeAction {
                     continue;
                 }
             }
-            String toolName = resp.name();
+            String toolName = executionLedger != null && executionLedger.receipts().containsKey(resp.id())
+                    ? executionLedger.receipts().get(resp.id()).toolName() : resp.name();
             if (toolName == null || toolName.isBlank() || AUTO_RECORD_SKIP.contains(toolName)) {
                 continue;
             }

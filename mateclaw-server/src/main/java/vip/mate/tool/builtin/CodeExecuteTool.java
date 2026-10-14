@@ -86,6 +86,8 @@ public class CodeExecuteTool {
         - args: optional positional arguments, given as ONE JSON-encoded string:
                 a JSON array for multiple args, or plain text for a single argument.
         - timeoutSeconds: optional, default 30, max 300.
+        Default output directory: the current input's artifactRoot. Skill-scoped code
+        keeps its skill directory and writes reports to MATECLAW_ARTIFACT_ROOT.
 
         Returns: JSON with exitCode, stdout, stderr, and (when the run wrote files)
         a generatedFiles array of [name](url) download links. When present, echo
@@ -94,6 +96,16 @@ public class CodeExecuteTool {
         Security: dangerous operations trigger security approval. The server's own
         secret environment variables are not exposed to the code.
         """)
+    /**
+     * 执行本轮代码并展示产物，默认输出隔离到输入轮次目录。
+     * @param language 执行语言
+     * @param code 用户授权的代码正文
+     * @param skillName 可选技能执行范围
+     * @param args 可选位置参数
+     * @param timeoutSeconds 执行超时秒数
+     * @param ctx 已认证会话上下文
+     * @return 执行结果及本轮生成文件
+     */
     public String execute_code(
         @JsonProperty(required = true)
         @JsonPropertyDescription("Language: python, bash, or node")
@@ -150,11 +162,13 @@ public class CodeExecuteTool {
                 envVars = skillSecretService.getDecrypted(skill.getId());
             }
         } else {
-            // Workspace-scoped run: prefer the agent's workspace base path so any
-            // files the code produces land where the user expects. When the agent
-            // has no workspace dir, pass null — executeCode then runs in a private
-            // temp scratch dir (same tolerance as the shell tool).
-            workingDir = WorkspacePathGuard.getWorkingDirectory(ctx);
+            // 默认代码在当前输入的产物目录运行；缺少输入来源时沿用工作区或临时目录。
+            try {
+                workingDir = vip.mate.agent.context.RuntimeArtifacts.prepare(ChatOrigin.from(ctx));
+            } catch (Exception e) {
+                return formatError("本轮产物目录不可用：" + e.getMessage());
+            }
+            if (workingDir == null) workingDir = WorkspacePathGuard.getWorkingDirectory(ctx);
             if (workingDir != null && !Files.isDirectory(workingDir)) {
                 workingDir = null;
             }
@@ -165,12 +179,23 @@ public class CodeExecuteTool {
 
         long runStart = System.currentTimeMillis();
         try {
+            Path artifactRoot = vip.mate.agent.context.RuntimeArtifacts.prepare(ChatOrigin.from(ctx));
+            if (artifactRoot != null) {
+                envVars = new java.util.HashMap<>(envVars);
+                envVars.put("MATECLAW_ARTIFACT_ROOT", artifactRoot.toString());
+            }
             SkillScriptExecutionService.ScriptResult result =
                     executionService.executeCode(language, code, workingDir, argList, envVars, timeout);
             // Surface any files the run wrote as one-click downloads so the user can
             // grab generated artifacts (xlsx / csv / images / …) without the model
             // having to call send_file or echo a server path.
-            List<String> fileLinks = WorkspaceArtifactSurfacer.collect(generatedFileCache, workingDir, runStart, ctx);
+            List<String> fileLinks = WorkspaceArtifactSurfacer.collect(generatedFileCache,
+                    artifactRoot == null ? workingDir : artifactRoot, runStart, ctx);
+            if (skillName != null && !skillName.isBlank() && workingDir != null
+                    && artifactRoot != null && !workingDir.equals(artifactRoot)) {
+                fileLinks = new ArrayList<>(fileLinks);
+                fileLinks.addAll(WorkspaceArtifactSurfacer.collect(generatedFileCache, workingDir, runStart, ctx));
+            }
             return formatResult(result, fileLinks);
         } catch (Exception e) {
             log.error("[CodeExecute] Execution failed: {}", e.getMessage());
@@ -178,24 +203,23 @@ public class CodeExecuteTool {
         }
     }
 
-    /**
-     * Decode the JSON-encoded {@code args} string into a positional argument list,
-     * mirroring {@code SkillScriptTool.normalizeArgs}: a JSON array becomes one
-     * argument per element, anything else is forwarded verbatim as a single
-     * argument (so a bare date / version string is never mangled by JSON parsing).
-     */
+    /** 在成员沙箱内执行代码，默认产物不与其他会话共享。 */
     private String executeIsolated(String language, String code, String skillName, String args,
                                    Integer timeoutSeconds, ToolContext ctx) {
         if (skillName != null && !skillName.isBlank()) return formatError("Shared skill execution is unavailable in member isolation mode");
         try {
             var scoped = vip.mate.workspace.core.service.MemberFileIsolation.scope(ChatOrigin.from(ctx));
             Path root = Path.of(scoped.workspaceBasePath());
+            Path artifactRoot = vip.mate.agent.context.RuntimeArtifacts.prepare(scoped);
+            Map<String, String> runtimeEnv = artifactRoot == null ? Map.of()
+                    : Map.of("MATECLAW_ARTIFACT_ROOT", artifactRoot.toString());
             long since = System.currentTimeMillis();
-            var output = memberSandboxExecutor.executeCode(language, code, root, normalizeArgs(args), Map.of(),
+            var output = memberSandboxExecutor.executeCode(language, code, root, normalizeArgs(args), runtimeEnv,
                     timeoutSeconds == null || timeoutSeconds <= 0 ? 30 : timeoutSeconds);
             var json = objectMapper.readTree(formatResult(new SkillScriptExecutionService.ScriptResult(
                     output.exitCode(), output.stdout(), output.stderr()),
-                    WorkspaceArtifactSurfacer.collect(generatedFileCache, root, since, scoped.toToolContext())));
+                    WorkspaceArtifactSurfacer.collect(generatedFileCache, artifactRoot == null ? root : artifactRoot,
+                            since, scoped.toToolContext())));
             ((com.fasterxml.jackson.databind.node.ObjectNode) json).put("timedOut", output.timedOut());
             return objectMapper.writeValueAsString(json);
         } catch (InterruptedException e) {

@@ -10,8 +10,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** A disposable display projection. Canonical entries and their identity never change. */
+/** 生成有界的进度展示投影，原始台账内容及条目标识保持不变。 */
 public final class ProgressLedgerProjection {
+    /** 普通进度备注仅展示短预览，完整正文保留在台账。 */
+    private static final int NOTE_PREVIEW_CHARS = 120;
+    /** 当前办理及受阻步骤保留较长交接备注，与进度工具承诺一致。 */
+    private static final int ACTIVE_NOTE_PREVIEW_CHARS = 512;
     public static final int DEFAULT_MAX_TOKENS = 2000;
     private static final ObjectMapper JSON = new ObjectMapper();
     private ProgressLedgerProjection() {}
@@ -33,6 +37,11 @@ public final class ProgressLedgerProjection {
         return counts;
     }
 
+    /**
+     * 生成进度行的有界展示，保留当前步骤的关键结论及证据引用。
+     * @param row 已定位的原始台账行
+     * @return 展示字段和明确截断标识，不修改原始台账
+     */
     public static Map<String, Object> preview(IndexedEntry row) {
         var entry = row.entry();
         Map<String, Object> out = new LinkedHashMap<>();
@@ -43,8 +52,11 @@ public final class ProgressLedgerProjection {
         out.put("keyTruncated", length(row.identity()) > prefix(row.identity(),80).length());
         out.put("label", prefix(entry.getLabel(), 100));
         out.put("labelTruncated", length(entry.getLabel()) > prefix(entry.getLabel(),100).length());
-        out.put("note", prefix(entry.getNote(), 120));
-        out.put("noteTruncated", length(entry.getNote()) > prefix(entry.getNote(),120).length());
+        int noteLimit = entry.getStatus() == ProgressStatus.IN_PROGRESS || entry.getStatus() == ProgressStatus.BLOCKED
+                ? ACTIVE_NOTE_PREVIEW_CHARS : NOTE_PREVIEW_CHARS;
+        String note = prefix(entry.getNote(), noteLimit);
+        out.put("note", note);
+        out.put("noteTruncated", length(entry.getNote()) > note.length());
         return out;
     }
 

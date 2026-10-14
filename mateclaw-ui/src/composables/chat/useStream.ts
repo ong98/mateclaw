@@ -254,8 +254,13 @@ export function useStream(options: UseStreamOptions): UseStreamReturn {
    */
   const seenEventIds = new Set<string>()
 
+  // 当前连接代数用于取消旧连接的恢复，避免切换会话后重新拉回。
+  let connectionGeneration = 0
+  let terminalReceived = false
+
   // 触发事件
   const emit = (event: SSEEvent) => {
+    if (event.type === 'done' || event.type === 'error') terminalReceived = true
     // De-dup by server-assigned id. Events without an id (legacy / heartbeat)
     // bypass — they're either idempotent or carry their own dedup logic.
     if (event.id) {
@@ -310,14 +315,19 @@ export function useStream(options: UseStreamOptions): UseStreamReturn {
   // 1..50 — the server filter `id <= 1000` would drop EVERY event in B).
   let lastDedupConversationId: string | null = null
 
-  const connect = async (body?: any) => {
+  const connect = async (body?: any, recoveryAttempt = 0): Promise<void> => {
     // 断开已有连接
     disconnect()
+    const generation = connectionGeneration
+    terminalReceived = false
+    let connectionTimedOut = false
+    let recoveryTried = false
 
     parser = new SSEParser()
     error.value = null
 
     const incomingConv = body?.conversationId ?? null
+    const canRecover = !!incomingConv && /\/chat\/stream(?:\?.*)?$/.test(url)
     const isReconnect = !!body?.reconnect
     // Reset dedup state when:
     //   - Fresh stream (not a reconnect) — always clears, matches the
@@ -333,6 +343,48 @@ export function useStream(options: UseStreamOptions): UseStreamReturn {
       lastEventId.value = null
     }
     lastDedupConversationId = incomingConv
+
+    // 恢复只查询状态及重订阅，不携带原消息，保证不会重启业务运行。
+    const recover = async (): Promise<boolean> => {
+      if (!canRecover || terminalReceived || generation !== connectionGeneration) return false
+      if (recoveryTried) return false
+      recoveryTried = true
+      if (streamTimeoutTimer) { clearTimeout(streamTimeoutTimer); streamTimeoutTimer = null }
+      abortController = new AbortController()
+      for (let attempt = recoveryAttempt; attempt < 4; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** attempt))
+        if (generation !== connectionGeneration) return true
+        try {
+          const token = localStorage.getItem('token')
+          const statusUrl = url.replace(/\/chat\/stream(?:\?.*)?$/, '')
+            + `/conversations/${encodeURIComponent(incomingConv)}/status`
+          const response = await fetch(statusUrl, {
+            headers: { ...headers, ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+            signal: abortController?.signal,
+          })
+          if (generation !== connectionGeneration) return true
+          if (response.status === 401 || response.status === 403) return false
+          if (!response.ok) continue
+          const envelope = await response.json()
+          if (generation !== connectionGeneration) return true
+          const status = envelope.data?.streamStatus
+          if (status === 'running' || status === 'generating') {
+            await connect({ conversationId: incomingConv, reconnect: true }, attempt + 1)
+            return true
+          }
+          if (typeof status === 'string') {
+            emit({ type: 'done', data: {
+              conversationId: incomingConv, persisted: true,
+              status: status === 'idle' ? 'completed' : status,
+            } })
+            return true
+          }
+        } catch {
+          if (generation !== connectionGeneration) return true
+        }
+      }
+      return false
+    }
 
     // Own the lastEventId injection here. Callers must NOT put their own
     // lastEventId in the body — connect() is the only layer that knows
@@ -415,6 +467,7 @@ export function useStream(options: UseStreamOptions): UseStreamReturn {
         if (streamTimeoutTimer) clearTimeout(streamTimeoutTimer)
         streamTimeoutTimer = setTimeout(() => {
           if (isReceiving.value && abortController) {
+            connectionTimedOut = true
             abortController.abort()
             const timeoutInfo: ChatErrorInfo = {
               category: 'timeout',
@@ -423,7 +476,6 @@ export function useStream(options: UseStreamOptions): UseStreamReturn {
               timestamp: Date.now(),
             }
             error.value = Object.assign(new Error('Stream timeout'), { errorInfo: timeoutInfo })
-            emit({ type: 'error', data: { message: 'Stream timeout', errorInfo: timeoutInfo } })
           }
         }, STREAM_TIMEOUT_MS)
       }
@@ -437,6 +489,8 @@ export function useStream(options: UseStreamOptions): UseStreamReturn {
         try {
           while (true) {
             const { done, value } = await reader.read()
+
+            if (generation !== connectionGeneration) return
 
             if (done) {
               break
@@ -458,35 +512,49 @@ export function useStream(options: UseStreamOptions): UseStreamReturn {
           flushEvents.forEach(emit)
           
         } catch (e) {
-          if (e instanceof Error && e.name === 'AbortError') {
+          if (e instanceof Error && e.name === 'AbortError' && !connectionTimedOut) {
             // 用户主动中止，不是错误
             return
           }
           throw e
         } finally {
-          isReceiving.value = false
-          isConnected.value = false
+          if (generation === connectionGeneration) {
+            isReceiving.value = false
+            isConnected.value = false
+          }
           reader.releaseLock()
         }
       }
 
       await read()
+      if (canRecover && !terminalReceived && generation === connectionGeneration) {
+        if (streamTimeoutTimer) { clearTimeout(streamTimeoutTimer); streamTimeoutTimer = null }
+        if (!(await recover()) && generation === connectionGeneration) {
+          throw new Error('连接已中断，自动恢复未成功，请重新连接查看运行结果')
+        }
+      }
       
     } catch (e) {
-      if (e instanceof Error && e.name === 'AbortError') {
+      if (generation !== connectionGeneration) return
+      if (e instanceof Error && e.name === 'AbortError' && !connectionTimedOut) {
         return
       }
+      const recoveryInfo = (e as any)?.errorInfo as ChatErrorInfo | undefined
+      if (!terminalReceived && recoveryInfo?.category !== 'auth_expired'
+          && recoveryInfo?.category !== 'forbidden' && recoveryInfo?.retryable !== false && await recover()) return
       error.value = e instanceof Error ? e : new Error(String(e))
       const errorInfo: ChatErrorInfo = (e as any)?.errorInfo
         || classifyNetworkError(error.value)
       emit({ type: 'error', data: { message: error.value.message, errorInfo } })
     } finally {
-      if (streamTimeoutTimer) {
+      if (generation === connectionGeneration && streamTimeoutTimer) {
         clearTimeout(streamTimeoutTimer)
         streamTimeoutTimer = null
       }
-      isReceiving.value = false
-      isConnected.value = false
+      if (generation === connectionGeneration) {
+        isReceiving.value = false
+        isConnected.value = false
+      }
     }
   }
 
@@ -505,6 +573,7 @@ export function useStream(options: UseStreamOptions): UseStreamReturn {
 
   // 断开连接
   const disconnect = () => {
+    connectionGeneration++
     if (streamTimeoutTimer) {
       clearTimeout(streamTimeoutTimer)
       streamTimeoutTimer = null

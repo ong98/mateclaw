@@ -21,6 +21,79 @@ import static org.mockito.ArgumentMatchers.*;
 import static vip.mate.agent.graph.state.MateClawStateKeys.*;
 /** 验证进度事实、回执与会话历史在模型上下文预算内保持完整。 */
 class ReasoningNodeProgressBudgetTest {
+ /** 捕获真实推理及压缩重试请求，正文引用只指向当前请求内仍可见的副本。 */
+ @org.junit.jupiter.params.ParameterizedTest
+ @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+ void duplicateReadProjectionDoesNotBecomeRetryHistory(boolean bridge) throws Exception {
+  var helper=mock(NodeStreamingChatHelper.class);var window=mock(ConversationWindowManager.class);
+  when(window.compactAgedToolResponses(anyList(),anyInt(),anyString(),nullable(String.class))).thenAnswer(inv->inv.getArgument(0));
+  when(window.pruneOldToolResultsForModelInput(anyList(),anyString(),nullable(String.class))).thenAnswer(inv->inv.getArgument(0));
+  String content="1\t相同的原始证据".repeat(500);
+  var json=new com.fasterxml.jackson.databind.ObjectMapper();
+  String oldBody=json.writeValueAsString(Map.of("filePath","source.txt","startLine",1,"startColumn",1,"endLine",50,"content",content));
+  String newBody=json.writeValueAsString(Map.of("filePath","source.txt","startLine",1,"startColumn",1,"endLine",100,"content",content));
+  String protocolName=bridge?"tool_call":"read_file";
+  Message oldCall=AssistantMessage.builder().content("").toolCalls(List.of(new AssistantMessage.ToolCall("old-read","function",protocolName,"{}"))).build();
+  Message newCall=AssistantMessage.builder().content("").toolCalls(List.of(new AssistantMessage.ToolCall("new-read","function",protocolName,"{}"))).build();
+  var ledger=ActionExecutionLedger.fromEvents(List.of(GraphEventPublisher.toolComplete("old-read","read_file",oldBody,true),GraphEventPublisher.toolComplete("new-read","read_file",newBody,true)));
+  Message oldRead=ToolResponseIdentity.attach(ToolResponseMessage.builder().responses(List.of(new ToolResponseMessage.ToolResponse("old-read",protocolName,oldBody))).build(),ledger);
+  Message newRead=ToolResponseIdentity.attach(ToolResponseMessage.builder().responses(List.of(new ToolResponseMessage.ToolResponse("new-read",protocolName,newBody))).build(),ledger);
+  List<Message> history=List.of(new UserMessage("ANCHOR"),oldCall,oldRead,newCall,newRead);
+  when(window.compactForRetry(anyList(),any(),anyString(),any())).thenReturn(List.of(new UserMessage("ANCHOR"),oldCall,oldRead));
+  when(helper.streamCall(any(),any(),anyString(),anyString())).thenReturn(
+    new NodeStreamingChatHelper.StreamResult(null,null,null,List.of(),false,0,0,false,"too long",NodeStreamingChatHelper.ErrorType.PROMPT_TOO_LONG),
+    new NodeStreamingChatHelper.StreamResult("done","",new AssistantMessage("done"),List.of(),false,0,0));
+  var node=new ReasoningNode(mock(ChatModel.class),AgentToolSet.fromCallbacks(List.of(),List.of()),null,false,helper,window,null,1024,null,null,null,null);
+  node.apply(new RunState(Map.of(CONVERSATION_ID,"conv",SYSTEM_PROMPT,"system",USER_MESSAGE,"ANCHOR",MESSAGES,history,MAX_ITERATIONS,100)));
+  var capture=org.mockito.ArgumentCaptor.forClass(Prompt.class);verify(helper,times(2)).streamCall(any(),capture.capture(),anyString(),anyString());
+  List<ToolResponseMessage.ToolResponse> first=capture.getAllValues().get(0).getInstructions().stream().filter(m->m instanceof ToolResponseMessage).map(m->(ToolResponseMessage)m).flatMap(m->m.getResponses().stream()).toList();
+  assertTrue(first.get(0).responseData().contains("new-read"));
+  assertEquals(newBody,first.get(1).responseData());
+  List<ToolResponseMessage.ToolResponse> retry=capture.getAllValues().get(1).getInstructions().stream().filter(m->m instanceof ToolResponseMessage).map(m->(ToolResponseMessage)m).flatMap(m->m.getResponses().stream()).toList();
+  assertEquals(1,retry.size());assertEquals(oldBody,retry.getFirst().responseData());
+ }
+ /** 模型请求保留已恢复的规范及数据，避免读取正文很快再次被年龄压缩。 */
+ @Test void restoredReadsKeepTheirBodiesWithinActualPromptBudget(
+         @org.junit.jupiter.api.io.TempDir java.nio.file.Path root) throws Exception {
+  var properties=new vip.mate.agent.graph.executor.ToolResultProperties();properties.setStorageBaseDir(root.toString());
+  var storage=new vip.mate.agent.graph.executor.ToolResultStorage(properties);
+  var window=new ConversationWindowManager(new vip.mate.config.ConversationWindowProperties(),null,null);
+  window.setToolResultStorage(storage);
+  var helper=mock(NodeStreamingChatHelper.class);
+  when(helper.streamCall(any(),any(),anyString(),anyString())).thenReturn(new NodeStreamingChatHelper.StreamResult("result","",new AssistantMessage("result"),List.of(),false,0,0));
+  var reader=new vip.mate.tool.builtin.ReadFileTool(mock(vip.mate.i18n.I18nService.class,
+          invocation -> "msg".equals(invocation.getMethod().getName()) ? invocation.getArgument(0) : null));
+  var events=new ArrayList<GraphEventPublisher.GraphEvent>();var originalCalls=new ArrayList<AssistantMessage.ToolCall>();
+  for(String tool:List.of("load_skill","readSkillFile","tool_describe","query_data")) {
+   events.add(GraphEventPublisher.toolComplete(tool,tool,"原始证据".repeat(300),true));
+   originalCalls.add(new AssistantMessage.ToolCall(tool,"function",tool,"{}"));
+  }
+  var ledger=ActionExecutionLedger.fromEvents(events).preserveResults(events,originalCalls,storage,"conv",root.toString());
+  var history=new ArrayList<Message>();history.add(new UserMessage("ANCHOR"));
+  var bodies=new LinkedHashMap<String,String>();
+  for(String tool:List.of("load_skill","readSkillFile","tool_describe","query_data")) {
+   String id="read-"+tool;String path=ledger.receipts().get(tool).resultRef();
+   String body=reader.read_file(path,null,null,null,null);bodies.put(id,body);
+   history.add(AssistantMessage.builder().content("").toolCalls(List.of(new AssistantMessage.ToolCall(id,"function","read_file","{}"))).build());
+   history.add(ToolResponseMessage.builder().responses(List.of(new ToolResponseMessage.ToolResponse(id,"read_file",body))).build());
+  }
+  for(int i=0;i<4;i++) {
+   String id="latest-"+i;
+   history.add(AssistantMessage.builder().content("").toolCalls(List.of(new AssistantMessage.ToolCall(id,"function","query_data","{}"))).build());
+   history.add(ToolResponseMessage.builder().responses(List.of(new ToolResponseMessage.ToolResponse(id,"query_data","recent"))).build());
+  }
+  var node=new ReasoningNode(mock(ChatModel.class),AgentToolSet.fromCallbacks(List.of(),List.of()),null,false,helper,window,null,1024,null,null,null,null);
+  node.setPrefixBudgetPlan(new PrefixBudgetPlan(true,24000,PrefixBudgetPlan.Profile.NORMAL,0,0,0,0,0,0,0));
+  node.apply(new RunState(Map.of(CONVERSATION_ID,"conv",SYSTEM_PROMPT,"system",USER_MESSAGE,"ANCHOR",MESSAGES,history,
+          MAX_ITERATIONS,100,ACTION_EXECUTION_LEDGER,ledger,WORKSPACE_BASE_PATH,root.toString())));
+  var captured=org.mockito.ArgumentCaptor.forClass(Prompt.class);verify(helper).streamCall(any(),captured.capture(),anyString(),anyString());
+  var results=new HashMap<String,String>();
+  for(Message message:captured.getValue().getInstructions()) if(message instanceof ToolResponseMessage response)
+   for(var item:response.getResponses()) results.put(item.id(),item.responseData());
+  for(String tool:List.of("load_skill","readSkillFile","tool_describe")) assertEquals(bodies.get("read-"+tool),results.get("read-"+tool));
+  assertEquals(bodies.get("read-query_data"),results.get("read-query_data"));
+  assertEquals("原始证据".repeat(300),java.nio.file.Files.readString(java.nio.file.Path.of(ledger.receipts().get("query_data").resultRef())));
+ }
  /** 压缩后的重试请求也必须满足实际模型窗口限制。 */
  @Test void compressedRetryIsCheckedAgainstActualWindowBeforeProviderCall() throws Exception {
   var helper=mock(NodeStreamingChatHelper.class);var window=mock(ConversationWindowManager.class);

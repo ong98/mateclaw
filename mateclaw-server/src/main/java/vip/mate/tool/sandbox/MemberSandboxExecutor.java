@@ -101,18 +101,20 @@ public class MemberSandboxExecutor {
         return execute(command, memberRoot, env, timeout, code);
     }
 
+    /** 构造成员容器命令，挂载完整成员工作区而默认工作目录可定位到本轮产物目录。 */
     List<String> command(List<String> command, Path memberRoot, Map<String, String> env, String name) throws IOException {
         if (command == null || command.isEmpty() || command.stream().anyMatch(Objects::isNull)) {
             throw new IllegalArgumentException("A sandbox command is required");
         }
         Path root = checkedRoot(memberRoot);
+        Path workingDirectory = artifactWorkingDirectory(root, env);
         List<String> cmd = new ArrayList<>(List.of(docker, "run", "--rm", "--pull=never", "--name", name,
                 "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--network=none",
                 "--pids-limit=64", "--memory=512m", "--memory-swap=512m", "--cpus=1",
                 "--ulimit", "nofile=256:256", "--init", "--log-driver=none",
                 "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777",
                 "--mount", "type=bind,src=" + root + ",dst=" + root,
-                "--workdir", root.toString()));
+                "--workdir", workingDirectory.toString()));
         // Match the mounted directory owner; the default image contains no privileged executables.
         // Unix metadata is required to avoid silently choosing an unrelated container user.
         Object uid = Files.getAttribute(root, "unix:uid", LinkOption.NOFOLLOW_LINKS);
@@ -140,6 +142,17 @@ public class MemberSandboxExecutor {
             throw new IllegalArgumentException("Invalid member directory");
         }
         return root;
+    }
+
+    /** 根据运行产物变量选择工作目录，成员工作区挂载边界保持不变。 */
+    static Path artifactWorkingDirectory(Path memberRoot, Map<String, String> env) throws IOException {
+        Path root = memberRoot.toRealPath();
+        Path directory = env != null && env.containsKey("MATECLAW_ARTIFACT_ROOT")
+                ? Path.of(env.get("MATECLAW_ARTIFACT_ROOT")).toRealPath() : root;
+        if (!Files.isDirectory(directory) || !directory.startsWith(root)) {
+            throw new IOException("Artifact directory is outside member workspace");
+        }
+        return directory;
     }
 
     private void removeContainer(String name) {

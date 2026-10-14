@@ -98,32 +98,12 @@ public class ConversationWindowManager {
     /** 短回执直接保留，避免为少量业务标识引入恢复步骤。 */
     private static final int SHORT_RECEIPT_CHARS = 512;
 
-    /**
-     * Tool names whose results must never be compacted into a one-line
-     * summary.
-     *
-     * <p>Sub-agent delegations are irreplaceable: the child runs an
-     * independent LLM session that the parent cannot reproduce, so dropping
-     * earlier batches forces the parent to re-dispatch the same children to
-     * recover what was lost.
-     *
-     * <p>{@code load_skill} returns the SKILL.md content at load time —
-     * a snapshot of the skill's constraints, flow, and script entrypoints.
-     * The skill author may update SKILL.md between the original load and a
-     * hypothetical re-load, so re-invoking {@code load_skill} does NOT
-     * guarantee recovering the same instructions the agent started with.
-     * Dropping the original also forces the agent to either re-load (token
-     * expensive for 50KB+ skills) or operate without constraints — the
-     * root cause of the "skill constraint forgetting" bug. Pinning the
-     * original ToolResponseMessage keeps the agent's understanding of the
-     * task's rules stable across context-window trims.
-     *
-     * <p>Every other tool (read_file, shell, search, memory) can be
-     * re-invoked cheaply if the parent decides it needs the data again.
-     */
+    /** 子任务结果与已读技能规范、工具契约不按响应年龄裁剪，聚合上下文预算仍可归档或摘要。 */
     private static final java.util.Set<String> PRUNE_EXEMPT_TOOLS = java.util.Set.of(
             "delegateToAgent",
             "delegateParallel",
+            "readSkillFile",
+            "tool_describe",
             "load_skill"
     );
 
@@ -918,7 +898,7 @@ public class ConversationWindowManager {
             boolean messageChanged = false;
             for (ToolResponseMessage.ToolResponse r : trm.getResponses()) {
                 String data = r.responseData();
-                String name = r.name();
+                String name = ToolResponseIdentity.name(trm, r);
                 boolean exempt = name != null && PRUNE_EXEMPT_TOOLS.contains(name);
                 boolean alreadySpilled = data != null
                         && data.startsWith(ToolResultStorage.SPILL_MARKER_PREFIX);
@@ -937,7 +917,7 @@ public class ConversationWindowManager {
                 if (data.length() > Math.max(DEDUP_MIN_CHARS, SHORT_RECEIPT_CHARS) && seenLargeOutputs.contains(data)) {
                     String replacement = "[" + name
                             + "] duplicate tool output omitted; same content appeared later.";
-                    newResponses.add(new ToolResponseMessage.ToolResponse(r.id(), name, replacement));
+                    newResponses.add(new ToolResponseMessage.ToolResponse(r.id(), r.name(), replacement));
                     messageChanged = true;
                     continue;
                 }
@@ -949,7 +929,7 @@ public class ConversationWindowManager {
                             data, name, r.id(), conversationId, workspaceBasePath);
                     if (candidate != null
                             && candidate.startsWith(ToolResultStorage.SPILL_MARKER_PREFIX)) {
-                        newResponses.add(new ToolResponseMessage.ToolResponse(r.id(), name, candidate));
+                        newResponses.add(new ToolResponseMessage.ToolResponse(r.id(), r.name(), candidate));
                         seenLargeOutputs.add(data);
                         messageChanged = true;
                         spilled++;
@@ -967,7 +947,7 @@ public class ConversationWindowManager {
                 }
             }
             if (messageChanged) {
-                pruned.set(i, ToolResponseMessage.builder().responses(newResponses).build());
+                pruned.set(i, ToolResponseMessage.builder().responses(newResponses).metadata(trm.getMetadata()).build());
                 changed++;
             }
         }
@@ -1006,6 +986,12 @@ public class ConversationWindowManager {
         return r != null
                 && r.name() != null
                 && PRUNE_EXEMPT_TOOLS.contains(r.name());
+    }
+
+    /** 按创建响应时绑定的真实执行身份判断技能规范及工具契约是否豁免裁剪。 */
+    private static boolean isExemptTool(ToolResponseMessage message, ToolResponseMessage.ToolResponse response) {
+        String name = ToolResponseIdentity.name(message, response);
+        return name != null && PRUNE_EXEMPT_TOOLS.contains(name);
     }
 
     /**
@@ -1050,17 +1036,17 @@ public class ConversationWindowManager {
             boolean messageChanged = false;
             for (ToolResponseMessage.ToolResponse r : trm.getResponses()) {
                 String body = r.responseData();
-                String name = r.name();
+                String name = ToolResponseIdentity.name(trm, r);
                 boolean exempt = name != null && PRUNE_EXEMPT_TOOLS.contains(name);
                 if (exempt || body == null || body.length() <= SHORT_RECEIPT_CHARS
                         || isSpillMarker(r) || toolResultStorage == null) {
                     newResponses.add(r);
                     continue;
                 }
-                String placeholder = toolResultStorage.compactForRecovery(body, name, r.id(),
-                        conversationId, workspaceBasePath);
+                String placeholder = toolResultStorage.compactForRecovery(
+                        body, name, r.id(), conversationId, workspaceBasePath);
                 if (placeholder.length() < body.length()) {
-                    newResponses.add(new ToolResponseMessage.ToolResponse(r.id(), name, placeholder));
+                    newResponses.add(new ToolResponseMessage.ToolResponse(r.id(), r.name(), placeholder));
                     messageChanged = true;
                     compacted++;
                 } else {
@@ -1070,7 +1056,7 @@ public class ConversationWindowManager {
                 }
             }
             if (messageChanged) {
-                out.set(i, ToolResponseMessage.builder().responses(newResponses).build());
+                out.set(i, ToolResponseMessage.builder().responses(newResponses).metadata(trm.getMetadata()).build());
                 anyChange = true;
             }
         }
@@ -1125,7 +1111,7 @@ public class ConversationWindowManager {
                         newResponses.add(r);
                         continue;
                     }
-                    if (isExemptTool(r) || mustKeepUnstoredReceipt(r)) {
+                    if (isExemptTool(trm, r) || mustKeepUnstoredReceipt(trm, r)) {
                         // Move 4: load_skill / delegateToAgent outputs are not
                         // safely recoverable — pass through verbatim.
                         newResponses.add(r);
@@ -1143,7 +1129,7 @@ public class ConversationWindowManager {
                     }
                 }
                 if (changed) {
-                    messages.set(i, ToolResponseMessage.builder().responses(newResponses).build());
+                    messages.set(i, ToolResponseMessage.builder().responses(newResponses).metadata(trm.getMetadata()).build());
                     trimmed++;
                 }
             }
@@ -1167,7 +1153,7 @@ public class ConversationWindowManager {
                         replaced.add(r);
                         continue;
                     }
-                    if (isExemptTool(r) || mustKeepUnstoredReceipt(r)) {
+                    if (isExemptTool(trm, r) || mustKeepUnstoredReceipt(trm, r)) {
                         // Move 4: exempt tools survive Phase 2 unchanged.
                         replaced.add(r);
                         continue;
@@ -1177,11 +1163,11 @@ public class ConversationWindowManager {
                         continue;
                     }
                     replaced.add(new ToolResponseMessage.ToolResponse(r.id(), r.name(),
-                            buildInformativeCleared(r.name(), r.responseData())));
+                            buildInformativeCleared(ToolResponseIdentity.name(trm, r), r.responseData())));
                     changed = true;
                 }
                 if (changed) {
-                    messages.set(i, ToolResponseMessage.builder().responses(replaced).build());
+                    messages.set(i, ToolResponseMessage.builder().responses(replaced).metadata(trm.getMetadata()).build());
                     cleared++;
                 }
             }
@@ -1203,8 +1189,8 @@ public class ConversationWindowManager {
                 // there's nothing to prune.
                 boolean hasSubstantial = trm.getResponses().stream()
                         .anyMatch(r -> !isSpillMarker(r)
-                                && !isExemptTool(r)
-                                && !mustKeepUnstoredReceipt(r)
+                                && !isExemptTool(trm, r)
+                                && !mustKeepUnstoredReceipt(trm, r)
                                 && r.responseData() != null
                                 && r.responseData().length() > SHORT_RECEIPT_CHARS);
                 if (hasSubstantial) {
@@ -1214,7 +1200,7 @@ public class ConversationWindowManager {
                             placeholders.add(r);
                             continue;
                         }
-                        if (isExemptTool(r) || mustKeepUnstoredReceipt(r)) {
+                        if (isExemptTool(trm, r) || mustKeepUnstoredReceipt(trm, r)) {
                             // Move 4: exempt tools survive Phase 3 pre-prune.
                             placeholders.add(r);
                             continue;
@@ -1224,9 +1210,9 @@ public class ConversationWindowManager {
                             continue;
                         }
                         placeholders.add(new ToolResponseMessage.ToolResponse(r.id(), r.name(),
-                                buildInformativeCleared(r.name(), r.responseData())));
+                                buildInformativeCleared(ToolResponseIdentity.name(trm, r), r.responseData())));
                     }
-                    messages.set(i, ToolResponseMessage.builder().responses(placeholders).build());
+                    messages.set(i, ToolResponseMessage.builder().responses(placeholders).metadata(trm.getMetadata()).build());
                     pruned++;
                 }
             }
@@ -1236,11 +1222,12 @@ public class ConversationWindowManager {
 
     /**
      * 保留未落盘的业务回执；读取类工具可以通过原始文件入口重新读取。
+     * @param message 绑定真实执行身份的消息
      * @param response 当前仍内联的结果
      * @return 已配置存储时是否必须保留尚未获得文件引用的回执
      */
-    private boolean mustKeepUnstoredReceipt(ToolResponseMessage.ToolResponse response) {
-        return toolResultStorage != null && !toolResultStorage.isRetrievalExcluded(response.name());
+    private boolean mustKeepUnstoredReceipt(ToolResponseMessage message, ToolResponseMessage.ToolResponse response) {
+        return toolResultStorage != null && !toolResultStorage.isRetrievalExcluded(ToolResponseIdentity.name(message, response));
     }
 
     /**
@@ -1261,7 +1248,7 @@ public class ConversationWindowManager {
             List<ToolResponseMessage.ToolResponse> newResponses = new ArrayList<>();
             boolean changed = false;
             for (ToolResponseMessage.ToolResponse r : trm.getResponses()) {
-                if (isSpillMarker(r) || isExemptTool(r)) {
+                if (isSpillMarker(r) || isExemptTool(trm, r)) {
                     newResponses.add(r);
                     continue;
                 }
@@ -1275,7 +1262,7 @@ public class ConversationWindowManager {
                     continue;
                 }
                 String spilledBody = toolResultStorage.compactForRecovery(
-                        data, r.name(), r.id(), conversationId, workspaceBasePath);
+                        data, ToolResponseIdentity.name(trm, r), r.id(), conversationId, workspaceBasePath);
                 if (spilledBody != data) {
                     // 已保存完整原文，仅将模型正文替换为可读引用。
                     newResponses.add(new ToolResponseMessage.ToolResponse(
@@ -1287,7 +1274,7 @@ public class ConversationWindowManager {
                 }
             }
             if (changed) {
-                messages.set(i, ToolResponseMessage.builder().responses(newResponses).build());
+                messages.set(i, ToolResponseMessage.builder().responses(newResponses).metadata(trm.getMetadata()).build());
             }
         }
         return spilled;

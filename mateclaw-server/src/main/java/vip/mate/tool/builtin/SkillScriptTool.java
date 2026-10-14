@@ -68,7 +68,17 @@ public class SkillScriptTool {
 
         Security: Only scripts under scripts/ directory can be executed. Path traversal is blocked.
         Timeout: 30 seconds per script execution.
+        Scripts receive MATECLAW_ARTIFACT_ROOT for reports and temporary data
+        isolated to the conversation and current user input; their cwd stays unchanged.
         """)
+    /**
+     * 执行授权技能脚本，并通过环境变量提供本轮隔离产物目录。
+     * @param skillName 已绑定技能名称
+     * @param scriptPath 技能内的脚本相对路径
+     * @param args 可选位置参数
+     * @param ctx 已认证执行上下文
+     * @return 脚本的退出码和标准输出
+     */
     public String runSkillScript(
         @JsonProperty(required = true)
         @JsonPropertyDescription("Skill name")
@@ -128,6 +138,11 @@ public class SkillScriptTool {
 
         // 执行脚本
         try {
+            var artifactRoot = vip.mate.agent.context.RuntimeArtifacts.prepare(ChatOrigin.from(ctx));
+            if (artifactRoot != null) {
+                envVars = new java.util.HashMap<>(envVars);
+                envVars.put("MATECLAW_ARTIFACT_ROOT", artifactRoot.toString());
+            }
             SkillScriptExecutionService.ScriptResult result = executionService.execute(resolvedPath, argList, envVars);
             return formatResult(result);
 

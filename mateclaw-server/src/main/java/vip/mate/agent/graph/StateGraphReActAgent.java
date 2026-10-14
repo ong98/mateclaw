@@ -602,6 +602,7 @@ public class StateGraphReActAgent extends BaseAgent implements StructuredStreamC
                 ? Flux.just(new RunStep("finalAnswer",new RunState(inputs))) : compiledGraph.stream(inputs);
     }
 
+    /** 初始化独立输入轮次的运行事实和成员来源，附加同会话上一轮检查点的只读入口。 */
     private Map<String, Object> buildInitialState(String userMessage, String conversationId) {
         var incoming = vip.mate.agent.context.ChatOriginHolder.get().withConversationId(conversationId);
         var memberOrigin = MemberFileIsolation.scope(incoming.withWorkspace(incoming.workspaceId(), this.workspaceBasePath));
@@ -717,6 +718,10 @@ public class StateGraphReActAgent extends BaseAgent implements StructuredStreamC
         origin = MemberFileIsolation.scope(origin);
         inputs.put(WORKSPACE_BASE_PATH, origin.workspaceBasePath() != null ? origin.workspaceBasePath() : "");
         inputs.put(CHAT_ORIGIN, origin);
+        String checkpointHint = vip.mate.agent.context.RuntimeCheckpoint.previousHint(origin);
+        if (!checkpointHint.isEmpty()) {
+            inputs.put(SYSTEM_PROMPT, inputs.get(SYSTEM_PROMPT) + checkpointHint);
+        }
 
         // RFC 48 — inject active goal snapshot for GoalEvaluationNode.
         // The node + dispatcher both bail out when ACTIVE_GOAL is absent,

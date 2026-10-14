@@ -18,6 +18,9 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 @ConfigurationProperties(prefix = "mate.agent.graph.observation")
 public class GraphObservationProperties {
 
+    /** 摘要模型单次输入预算，包含目标、进度、执行事实及观察投影；原文仍完整保存。 */
+    private int summaryInputMaxTokens = 12000;
+
     /** Max chars retained per tool result (truncate above this). Tune via yml. */
     private int maxSingleObservationChars = 4000;
 

@@ -832,6 +832,7 @@ public class ReasoningNode implements NodeAction {
         // ledger discipline before it drifts into the "I'm doing the work
         // but never marking it" failure mode observed in round-4 of the
         // LLM-review smoke test.
+        String currentWorkingSet = "";
         if (progressLedgerService != null && conversationId != null && !conversationId.isBlank()) {
             try {
                 vip.mate.agent.progress.ProgressLedger ledger =
@@ -839,10 +840,12 @@ public class ReasoningNode implements NodeAction {
                 String snapshot = prefixBudgetPlan != null && prefixBudgetPlan.enabled()
                         ? ledger.renderSnapshot(prefixBudgetPlan.ledgerTokens()) : ledger.renderSnapshot();
                 if (snapshot != null) {
+                    currentWorkingSet = snapshot;
                     nonHistoryPrefix.add(new SystemMessage(snapshot));
                 }
-                String staleReminder = ledger.renderStaleReminder(
-                        accessor.iterationCount(), java.time.Instant.now());
+                long latestExecution = accessor.actionExecutionLedger().lastCompletedAt();
+                String staleReminder = latestExecution > 0 && System.currentTimeMillis() - latestExecution < 90_000
+                        ? null : ledger.renderStaleReminder(accessor.iterationCount(), java.time.Instant.now());
                 if (staleReminder != null) {
                     nonHistoryPrefix.add(new SystemMessage(staleReminder));
                     log.info("[ReasoningNode] Injected stale-ledger reminder at iter {} for conv {}",
@@ -896,10 +899,6 @@ public class ReasoningNode implements NodeAction {
         // Execution receipts are authoritative and independent of compacted
         // conversation history. Inject before streamCall so both live tokens
         // and the persisted final answer are generated with these facts.
-        String executionFacts = accessor.actionExecutionLedger().renderAnswerFacts();
-        if (!executionFacts.isEmpty()) {
-            nonHistoryPrefix.add(new SystemMessage(executionFacts));
-        }
 
         if (conversationWindowManager != null) {
             // 按响应年龄压缩长正文前保存原文，短回执及调用关联保持完整。
@@ -917,6 +916,20 @@ public class ReasoningNode implements NodeAction {
             messages = conversationWindowManager.pruneOldToolResultsForModelInput(
                     messages, conversationId, receiptWorkspace);
         }
+
+        var visibleReceiptIds = new java.util.HashSet<String>();
+        for (Message message : messages) {
+            if (message instanceof ToolResponseMessage toolMessage) {
+                for (var response : toolMessage.getResponses()) {
+                    if (response.responseData() != null
+                            && !response.responseData().startsWith("[mate-tool-result-spill]")) {
+                        visibleReceiptIds.add(response.id());
+                    }
+                }
+            }
+        }
+        String executionFacts = accessor.actionExecutionLedger().renderAnswerFacts(visibleReceiptIds, currentWorkingSet);
+        if (!executionFacts.isEmpty()) nonHistoryPrefix.add(new SystemMessage(executionFacts));
 
         // 请求级思考深度覆盖（ThinkingLevelHolder 由 AgentService 设置）
         String effectiveReasoning = resolveEffectiveReasoningEffort();
@@ -965,8 +978,15 @@ public class ReasoningNode implements NodeAction {
                     t.capExceededForPairIntegrity(), t.minTailFloorApplied(), conversationId);
         }
         messages = budgeted.messages();
+        int beforeReadDedupTokens = TokenEstimator.estimateTokens(messages);
+        List<Message> modelHistory = vip.mate.agent.context.ReadResultDeduplicator.project(messages);
+        int readDedupSavedTokens = beforeReadDedupTokens - TokenEstimator.estimateTokens(modelHistory);
+        if (readDedupSavedTokens > 0) {
+            log.info("[ReasoningNode] read_content_dedup: conversationId={} savedEstimatedTokens={}",
+                    conversationId, readDedupSavedTokens);
+        }
         List<Message> promptMessages = new ArrayList<>(nonHistoryPrefix);
-        promptMessages.addAll(messages);
+        promptMessages.addAll(modelHistory);
 
         Prompt prompt = new Prompt(promptMessages, options);
 

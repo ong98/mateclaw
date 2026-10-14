@@ -22,6 +22,23 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class ChatStreamTrackerCleanupTest {
 
+    /** 长运行刚完成时仍保留完整回放期，不被创建时间或旧空闲时刻提前清理。 */
+    @Test
+    void completedLongRunRetainsReplayWindow() {
+        ChatStreamTracker tracker = newTracker();
+        tracker.register("conv-long");
+        var runs = (java.util.Map<?, ?>) org.springframework.test.util.ReflectionTestUtils.getField(tracker, "runs");
+        Object state = runs.get("conv-long");
+        org.springframework.test.util.ReflectionTestUtils.setField(state, "createdAt", System.currentTimeMillis() - 12 * 60_000L);
+        tracker.complete("conv-long");
+        tracker.backdateLastEventForTesting("conv-long", System.currentTimeMillis() - 12 * 60_000L);
+        tracker.cleanupStaleRuns();
+        assertTrue(tracker.hasRunStateForTesting("conv-long"));
+        org.springframework.test.util.ReflectionTestUtils.setField(state, "completedAt", System.currentTimeMillis() - 6 * 60_000L);
+        tracker.cleanupStaleRuns();
+        assertFalse(tracker.hasRunStateForTesting("conv-long"));
+    }
+
     private static ChatStreamTracker newTracker() {
         ChatStreamTracker t = new ChatStreamTracker(new ObjectMapper());
         // Tighten the idle threshold so the test stays at unit-test speed.

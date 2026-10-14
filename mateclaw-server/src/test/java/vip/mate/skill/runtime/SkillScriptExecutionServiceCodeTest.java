@@ -21,6 +21,19 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * suite stays green on hosts without python / bash (e.g. Windows CI).
  */
 class SkillScriptExecutionServiceCodeTest {
+    /** 真实 Python 子进程的中文、表情、错误输出和默认文件读写必须与 UTF-8 回执协议一致。 */
+    @Test
+    void pythonUnicodeRoundTripUsesUtf8(@TempDir Path dir) {
+        assumeTrue(hasInterpreter(IS_WINDOWS ? "python" : "python3"));
+        var result = service.executeCode("python",
+                "import pathlib,sys\np=pathlib.Path('证据.txt')\np.write_text('质检完成😀')\n"
+                        + "print(p.read_text())\nprint('中文错误😀',file=sys.stderr)",
+                dir, null, Map.of("PYTHONIOENCODING", "ascii", "PYTHONUTF8", "0"), null);
+        assertThat(result.getExitCode()).isZero();
+        assertThat(result.getStdout()).contains("质检完成😀").doesNotContain("\uFFFD");
+        assertThat(result.getStderr()).contains("中文错误😀").doesNotContain("\uFFFD");
+    }
+
 
     private static final boolean IS_WINDOWS =
             System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");

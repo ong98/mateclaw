@@ -71,14 +71,13 @@ public final class RuntimeContextInjector {
     }
 
     /**
-     * Full overload that also renders the agent's runtime model identity.
-     * The model line is emitted for EVERY origin (web / cron / IM / null)
-     * because it describes the agent, not the caller — only the sender
-     * block stays IM-only. {@code modelName}/{@code providerId} come from
-     * graph state ({@code RUNTIME_MODEL_NAME}/{@code RUNTIME_PROVIDER_ID}),
-     * i.e. the model selected at run start (mid-run failover is not
-     * reflected — accepted trade-off). Stays well under the 1024-char
-     * spring-ai user-cache threshold.
+     * 为当前调用提供时间、工作区、产物目录、用户来源与实际运行模型。
+     * @param workspaceBasePath 当前工作区根目录
+     * @param i18n 可选本地化服务
+     * @param origin 已认证会话及输入来源
+     * @param modelName 本轮启动时选择的模型
+     * @param providerId 对应模型提供方标识
+     * @return 有界的运行环境说明，不包含业务办理规则
      */
     public static String buildContextMessage(String workspaceBasePath,
                                               vip.mate.i18n.I18nService i18n,
@@ -106,6 +105,13 @@ public final class RuntimeContextInjector {
                 sb.append("\nYou can only read/write files and execute commands within this directory and its subdirectories.");
             }
             appendSkillRootHintIfPresent(sb, workspaceBasePath, i18n);
+        }
+
+        var artifactRoot = RuntimeArtifacts.directory(origin);
+        if (artifactRoot != null) {
+            sb.append("\n[system-context] artifactRoot: ").append(artifactRoot)
+                    .append("\n默认生成报告、数据、结果合同及过程文件请放在 artifactRoot；")
+                    .append("代码执行默认在该目录运行，原工作区仍可按绝对路径访问。用户指定输出路径时遵循用户要求。");
         }
 
         appendSenderBlockIfPresent(sb, origin);

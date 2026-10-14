@@ -71,6 +71,12 @@ public class ObservationNode implements NodeAction {
         this.streamTracker = streamTracker;
     }
 
+    /**
+     * 根据真实执行台账标准化观察，保留协议调用配对并更新迭代与循环检测结果。
+     * @param state 当前运行状态，包含本批调用、回应和真实执行事实
+     * @return 观察历史、计数及后续调度使用的状态增量
+     * @throws Exception 观察处理失败或用户停止当前执行
+     */
     @Override
     @SuppressWarnings("unchecked")
     public Map<String, Object> apply(RunState state) throws Exception {
@@ -110,7 +116,10 @@ public class ObservationNode implements NodeAction {
 
         // 将每个工具结果通过 ObservationProcessor 标准化和截断
         List<String> processedObservations = toolResults.stream()
-                .map(tr -> observationProcessor.process(tr.name(), tr.responseData()))
+                .map(tr -> {
+                    var receipt = accessor.actionExecutionLedger().receipts().get(tr.id());
+                    return observationProcessor.process(receipt == null ? tr.name() : receipt.toolName(), tr.responseData());
+                })
                 .collect(Collectors.toList());
 
         // 合并为单条观察记录

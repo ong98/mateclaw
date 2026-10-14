@@ -162,6 +162,7 @@ public class SkillScriptExecutionService {
         }
     }
 
+    /** 按文件类型执行脚本并收集有界 UTF-8 回执，统一 Python 编码以防 Windows 中文输出损坏。 */
     private ScriptResult executeResolved(Path scriptPath, List<String> args, Map<String, String> envVars,
                                          long timeoutSeconds, boolean scrubSensitiveEnv) {
         if (MemberFileIsolation.isEnabled()) return ScriptResult.error(-1, "Skill script execution is unavailable in member isolation mode");
@@ -245,6 +246,11 @@ public class SkillScriptExecutionService {
                 }
             }
             injectPipMirrorEnv(pb);
+            if (fileName.endsWith(".py")) {
+                // 输出解码固定为 UTF-8，子进程必须遵循相同约定；默认文件文本也使用 UTF-8。
+                pb.environment().put("PYTHONIOENCODING", "utf-8");
+                pb.environment().put("PYTHONUTF8", "1");
+            }
 
             process = pb.start();
 

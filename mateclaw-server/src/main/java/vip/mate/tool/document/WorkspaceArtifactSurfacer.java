@@ -42,10 +42,12 @@ public final class WorkspaceArtifactSurfacer {
     private WorkspaceArtifactSurfacer() {}
 
     /**
-     * Register files created or modified in {@code workingDir} at or after
-     * {@code sinceMillis} into the cache and return their download links.
-     * Returns an empty list when there is no persistent working dir (e.g. a
-     * private scratch dir that gets deleted after the run).
+     * 将本次运行写入的文件注册为下载链接；噪声判断仅检查产物根目录以内的相对路径。
+     * @param cache 具有成员归属的生成文件缓存
+     * @param workingDir 本次执行产物的根目录，可以位于隐藏的运行目录下
+     * @param sinceMillis 本次执行开始时间，排除早于此次执行的文件
+     * @param ctx 已认证的会话上下文
+     * @return 可展示的下载链接，目录不可用或收集失败时返回空集合
      */
     public static List<String> collect(GeneratedFileCache cache, @Nullable Path workingDir,
                                        long sinceMillis, @Nullable ToolContext ctx) {
@@ -57,7 +59,7 @@ public final class WorkspaceArtifactSurfacer {
         try (Stream<Path> walk = Files.walk(workingDir, SCAN_DEPTH)) {
             List<Path> candidates = walk
                     .filter(p -> Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS))
-                    .filter(p -> !isNoise(p))
+                    .filter(p -> !isNoise(workingDir.relativize(p)))
                     .filter(p -> modifiedSince(p, sinceMillis))
                     .limit(MAX_SCAN_CANDIDATES)
                     .toList();

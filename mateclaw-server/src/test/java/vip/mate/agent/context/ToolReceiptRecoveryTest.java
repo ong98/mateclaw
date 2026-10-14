@@ -18,6 +18,31 @@ import static org.junit.jupiter.api.Assertions.*;
 /** 验证领取回执经过多轮取证和压缩后仍可读取，避免通过重复领取找回结果。 */
 class ToolReceiptRecoveryTest {
 
+    /** 已恢复正文不按年龄重新变成引用，避免模型反复取证；原始文件不修改也不递归归档。 */
+    @Test
+    void recoveredReadKeepsBodyWithoutNestedArchive(@TempDir Path directory) throws Exception {
+        var properties = new ToolResultProperties();
+        properties.setStorageBaseDir(directory.toString());
+        var storage = new ToolResultStorage(properties);
+        var manager = new ConversationWindowManager(new ConversationWindowProperties(), null, null);
+        manager.setToolResultStorage(storage);
+        String original = "完整证据".repeat(4000);
+        String source = storage.preserveForRecovery(original, "query_data", "original", "conv", directory.toString());
+        var reader = new vip.mate.tool.builtin.ReadFileTool(org.mockito.Mockito.mock(vip.mate.i18n.I18nService.class,
+                invocation -> "msg".equals(invocation.getMethod().getName()) ? invocation.getArgument(0) : null));
+        String body = reader.read_file(source, null, null, null, null);
+        var history = List.<Message>of(response("recover", "read_file", body), response("latest", "query_data", "下一步"));
+        var compacted = manager.compactAgedToolResponses(history, 1, "conv", directory.toString());
+        assertEquals(body, ((ToolResponseMessage) compacted.getFirst()).getResponses().getFirst().responseData());
+        assertEquals(body, reader.read_file(source, null, null, null, null));
+        assertEquals(original, Files.readString(Path.of(source)));
+        try (var files = Files.list(Path.of(source).getParent())) {
+            assertEquals(1, files.count(), "读取回执不产生嵌套原文文件");
+        }
+        assertEquals(body, ((ToolResponseMessage) manager.compactAgedToolResponses(history, 1,
+                "conv", directory.toString()).getFirst()).getResponses().getFirst().responseData());
+    }
+
     /** 短领取回执在超过最近三轮后仍保留完整明细。 */
     @Test
     void shortClaimSurvivesThirtyEvidenceRounds() {

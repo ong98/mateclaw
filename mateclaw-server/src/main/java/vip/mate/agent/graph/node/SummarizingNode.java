@@ -17,7 +17,10 @@ import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import vip.mate.llm.dashscope.NativeDashScopeChatOptions;
 import vip.mate.agent.GraphEventPublisher;
-import vip.mate.agent.context.StructuredTruncator;
+import vip.mate.agent.context.ObservationSummaryInput;
+import vip.mate.agent.context.TokenEstimator;
+import vip.mate.agent.graph.executor.ToolResultStorage;
+import vip.mate.agent.progress.ProgressLedgerService;
 import vip.mate.agent.graph.NodeStreamingChatHelper;
 import vip.mate.agent.graph.state.MateClawStateAccessor;
 import vip.mate.agent.prompt.PromptLoader;
@@ -55,6 +58,25 @@ public class SummarizingNode implements NodeAction {
     private final NodeStreamingChatHelper streamingHelper;
     private final ChatStreamTracker streamTracker;
 
+    /** 摘要观察原文复用已有存储，未配置或归档失败时保护正文。 */
+    private ToolResultStorage toolResultStorage;
+    /** 从原进度台账提取当前步骤，进度文字不作为执行成功证明。 */
+    private ProgressLedgerService progressLedgerService;
+    /** 包含摘要系统提示及工作集的独立输入预算。 */
+    private int inputMaxTokens = 12000;
+
+    /**
+     * 配置摘要输入预算和恢复依赖，复用原执行台账及文件存储。
+     * @param storage 当前原文存储
+     * @param progressService 当前进度台账服务
+     * @param maxTokens 摘要输入预算，原目标与未归档正文不因预算丢失
+     */
+    public void configureInput(ToolResultStorage storage, ProgressLedgerService progressService, int maxTokens) {
+        this.toolResultStorage = storage;
+        this.progressLedgerService = progressService;
+        this.inputMaxTokens = Math.max(1, maxTokens);
+    }
+
     public SummarizingNode(ChatModel chatModel, NodeStreamingChatHelper streamingHelper, ChatStreamTracker streamTracker) {
         this.chatModel = chatModel;
         this.streamingHelper = streamingHelper;
@@ -73,6 +95,12 @@ public class SummarizingNode implements NodeAction {
         this(chatModel, null, null);
     }
 
+    /**
+     * 在独立输入预算内生成交接摘要，原观察可恢复，真实事实及当前目标优先保留。
+     * @param state 当前执行事实、目标与观察历史
+     * @return 摘要及使用量状态增量，原推理历史不在此裁剪
+     * @throws Exception 用户停止或摘要调用无法完成
+     */
     @Override
     public Map<String, Object> apply(RunState state) throws Exception {
         MateClawStateAccessor accessor = new MateClawStateAccessor(state);
@@ -95,15 +123,37 @@ public class SummarizingNode implements NodeAction {
                 "summaryChars", accessor.totalObservationChars()
         ));
 
-        // 构建 summarize prompt
-        StringBuilder observationText = new StringBuilder();
-        for (int i = 0; i < observations.size(); i++) {
-            observationText.append(String.format("【第 %d 轮观察】\n%s\n\n", i + 1, observations.get(i)));
+        String workingSet = "";
+        if (progressLedgerService != null) {
+            try {
+                workingSet = progressLedgerService.load(conversationId).renderSnapshot(2000);
+            } catch (RuntimeException unavailable) {
+                log.warn("[SummarizingNode] progress unavailable for conv={}: {}", conversationId, unavailable.getMessage());
+            }
         }
+        String facts = accessor.actionExecutionLedger().renderAnswerFacts(java.util.Set.of(), workingSet);
+        String handoff = "\n[当前任务工作集；进度文字不是执行证明]\n" + workingSet + "\n" + facts;
+        if (!accessor.summarizedContext().isBlank()) {
+            handoff += "\n[上一阶段摘要；以本轮真实回执为准]\n" + accessor.summarizedContext();
+        }
+        String workspace = state.value(vip.mate.agent.graph.state.MateClawStateKeys.WORKSPACE_BASE_PATH, "");
+        if (vip.mate.workspace.core.service.MemberFileIsolation.isEnabled()) {
+            var scoped = vip.mate.workspace.core.service.MemberFileIsolation.scope(accessor.chatOrigin());
+            workspace = scoped == null ? null : scoped.workspaceBasePath();
+        }
+        String skeleton = USER_TEMPLATE.replace("{question}", userInput).replace("{observations}", handoff);
+        int reserved = TokenEstimator.estimateTokens(SYSTEM_PROMPT) + TokenEstimator.estimateTokens(skeleton) + 16;
+        var input = ObservationSummaryInput.prepare(observations, toolResultStorage, conversationId,
+                "summary-" + accessor.chatOrigin().originMessageId() + "-" + accessor.iterationCount()
+                        + "-" + accessor.toolCallCount(), workspace,
+                Math.max(0, inputMaxTokens - reserved));
+        log.info("[SummarizingNode] input_budget: conversationId={} originalChars={} observationTokens={} "
+                        + "reservedTokens={} inputMaxTokens={} archiveFailed={}", conversationId, input.originalChars(),
+                TokenEstimator.estimateTokens(input.text()), reserved, inputMaxTokens, input.archiveFailed());
 
         String userPrompt = USER_TEMPLATE
                 .replace("{question}", userInput)
-                .replace("{observations}", observationText.toString());
+                .replace("{observations}", handoff + "\n" + input.text());
 
         List<Message> promptMessages = new ArrayList<>();
         promptMessages.add(new SystemMessage(SYSTEM_PROMPT));
@@ -119,14 +169,11 @@ public class SummarizingNode implements NodeAction {
         NodeStreamingChatHelper.StreamResult result = streamingHelper.streamCall(
                 chatModel, summarizePrompt, conversationId, "summarizing");
 
-        // 错误处理：摘要失败时用原始观察的前 500 字符作为 fallback
+        // 摘要失败时保留目标、执行事实及可恢复观察，不再丢弃为前 500 字符。
         if (result.hasFatalError()) {
             log.warn("[SummarizingNode] Summarization LLM call failed: {}, using raw observations as fallback",
                     result.errorMessage());
-            String fallback = observationText.length() > 500
-                    ? StructuredTruncator.headSlice(observationText.toString(), 500)
-                            + "\n...[摘要生成失败，仅保留原始观察的前部片段；数据不完整，请勿编造、补全或重新编号缺失内容]"
-                    : observationText.toString();
+            String fallback = "[原始目标]\n" + userInput + handoff + "\n" + input.text();
             AssistantMessage fallbackMsg = new AssistantMessage("[工具观察摘要(降级)]\n" + fallback);
             return MateClawStateAccessor.output()
                     .summarizedContext(fallback)
@@ -174,6 +221,10 @@ public class SummarizingNode implements NodeAction {
 
         // 将摘要注入 messages，让下一轮 ReasoningNode 能看到之前的工具调用结论
         String summaryContent = summarized != null ? summarized : "";
+        if (input.sourcePath() != null) {
+            summaryContent += "\n[完整观察快照] " + input.sourcePath()
+                    + "\n摘要有损；省略内容按需只读恢复，不重放历史工具。";
+        }
         AssistantMessage summaryMessage = new AssistantMessage(
                 "[工具观察摘要]\n" + summaryContent);
 

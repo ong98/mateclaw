@@ -6,7 +6,28 @@ import java.time.Instant;
 import java.util.LinkedHashMap;
 import static org.junit.jupiter.api.Assertions.*;
 
+/** 验证模型可见进度的预算、来源和交接信息保持完整。 */
 class ProgressLedgerProjectionTest {
+    /** 当前及受阻步骤的 120 字符后证据仍可见，完成项保持短预览且原始备注不变。 */
+    @Test void activeHandoffKeepsEvidenceBeyondOrdinaryPreview() {
+        String evidence = "call_original_evidence";
+        String note = "材".repeat(200) + evidence + "下一步生成报告" + "料".repeat(400);
+        for (ProgressStatus status : new ProgressStatus[]{ProgressStatus.IN_PROGRESS, ProgressStatus.BLOCKED}) {
+            var ledger = new ProgressLedger(java.util.Map.of("current", entry("current", status, note)));
+            var preview = ProgressLedgerProjection.preview(ProgressLedgerProjection.indexed(ledger).getFirst());
+            assertEquals(512, ((String) preview.get("note")).length());
+            assertEquals(true, preview.get("noteTruncated"));
+            String rendered = ledger.renderSnapshot(2000);
+            assertTrue(rendered.contains(evidence));
+            assertTrue(rendered.contains("下一步生成报告"));
+            assertTrue(TokenEstimator.estimateTokens(rendered) <= 2000);
+            assertEquals(note, ledger.asMap().get("current").getNote());
+        }
+        var completed = new ProgressLedger(java.util.Map.of("done", entry("done", ProgressStatus.DONE, note)));
+        var preview = ProgressLedgerProjection.preview(ProgressLedgerProjection.indexed(completed).getFirst());
+        assertEquals(120, ((String) preview.get("note")).length());
+        assertFalse(completed.renderSnapshot(2000).contains(evidence));
+    }
     @Test void boundedSnapshotPrioritizesCurrentWorkAndPreservesPinsAndStorage() {
         var entries = new LinkedHashMap<String, ProgressEntry>();
         for (int i=0;i<100;i++) entries.put("done"+i, entry("done"+i, ProgressStatus.DONE, "x".repeat(5000)));

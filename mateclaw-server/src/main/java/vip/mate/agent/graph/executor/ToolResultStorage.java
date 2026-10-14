@@ -158,7 +158,7 @@ public class ToolResultStorage {
 
     /**
      * 保存工具原始回执，供上下文压缩后的只读恢复；读取工具沿用原文件入口。
-     * 已落盘结果直接复用引用，不把预览覆盖到原始文件中。
+     * 已落盘结果直接复用引用，不把预览覆盖到原始文件中；技能读取虽不自动外置，仍归档原版本。
      *
      * @param result 本次调用返回的完整正文或已有落盘标记
      * @param toolName 实际执行的工具名称
@@ -170,7 +170,8 @@ public class ToolResultStorage {
     public String preserveForRecovery(String result, String toolName, String toolUseId,
                                       String conversationId, String workspaceBasePath) {
         if (!props.isEnabled() || result == null || conversationId == null || conversationId.isBlank()
-                || toolUseId == null || toolUseId.isBlank() || isExcluded(toolName)) return null;
+                || toolUseId == null || toolUseId.isBlank()
+                || (isExcluded(toolName) && !java.util.Set.of("readSkillFile", "load_skill").contains(toolName))) return null;
         String existing = spillPath(result);
         if (existing != null) return existing;
         Path file = spillFor(conversationId, toolUseId, workspaceBasePath);

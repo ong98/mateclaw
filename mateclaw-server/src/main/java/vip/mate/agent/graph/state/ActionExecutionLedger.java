@@ -15,12 +15,20 @@ import java.util.Set;
 /** 保存本轮工具执行回执及原文索引，为完成度判断和压缩后的只读恢复提供依据。 */
 public final class ActionExecutionLedger {
 
+    /** 短回执直接可见的最大字符数，长证据始终通过原文引用读取。 */
     private static final int MAX_RESULT_SUMMARY_CHARS = 512;
+    /** 发现与进度调用不计作业务或取证执行。 */
     private static final Set<String> NON_SUBSTANTIVE_TOOLS = Set.of(
             "load_skill", "enable_tool", "tool_search", "tool_describe",
             "progress_update", "get_progress");
 
-    public enum Status { SUCCEEDED, FAILED }
+    /** 工具执行状态，不推断业务流程是否完成。 */
+    public enum Status {
+        /** 工具执行返回成功。 */
+        SUCCEEDED,
+        /** 工具执行返回失败。 */
+        FAILED
+    }
 
     /**
      * 一次工具执行的回执，调用标识和原文引用不随模型历史裁剪而改变。
@@ -38,10 +46,22 @@ public final class ActionExecutionLedger {
         public boolean substantive() {
             return toolName != null && !NON_SUBSTANTIVE_TOOLS.contains(toolName);
         }
+
+        /** @return 是否为已读取的技能或工具契约，用于本轮资料复用 */
+        public boolean material() {
+            return Set.of("load_skill", "readSkillFile", "tool_describe").contains(toolName);
+        }
+
+        /** @return 是否需要原文目录入口，读取回执本身不再次进入恢复目录 */
+        public boolean recoverable() {
+            return material() || (substantive() && !"read_file".equals(toolName));
+        }
     }
 
+    /** 尚未执行工具的空台账。 */
     private static final ActionExecutionLedger EMPTY = new ActionExecutionLedger(Map.of());
 
+    /** 按真实调用标识保存的独立执行记录。 */
     private final Map<String, Receipt> receipts;
 
     /** 本轮全部回执的文件索引，正文展示数量受限时仍可读取早期结果。 */
@@ -58,6 +78,7 @@ public final class ActionExecutionLedger {
         this.recoveryIndexPath = recoveryIndexPath;
     }
 
+    /** @return 没有执行事实的初始台账 */
     public static ActionExecutionLedger empty() {
         return EMPTY;
     }
@@ -112,7 +133,7 @@ public final class ActionExecutionLedger {
             if (!GraphEventPublisher.EVENT_TOOL_COMPLETE.equals(event.type())) continue;
             String id = String.valueOf(event.data().getOrDefault("toolCallId", ""));
             Receipt receipt = preserved.get(id);
-            if (receipt == null || !receipt.substantive() || directIds.contains(id)) continue;
+            if (receipt == null || !receipt.recoverable() || directIds.contains(id)) continue;
             String raw = String.valueOf(event.data().getOrDefault("result", ""));
             String resultRef = storage.preserveForRecovery(raw, receipt.toolName(), id,
                     conversationId, workspaceBasePath);
@@ -127,7 +148,7 @@ public final class ActionExecutionLedger {
     }
 
     /**
-     * 保存本轮全部实质调用的有界摘要和原文引用，按首条调用区分显式新一轮执行。
+     * 保存本轮可恢复调用的定位目录和原文引用，按首条调用区分显式新一轮执行。
      * @param storage 当前回执存储
      * @param conversationId 当前会话
      * @param workspaceBasePath 当前工作区隔离目录
@@ -140,19 +161,21 @@ public final class ActionExecutionLedger {
                 .sorted(Comparator.comparingLong(Receipt::completedAt).thenComparing(Receipt::toolCallId)).toList();
         var index = new ObjectMapper().createObjectNode();
         index.put("conversationId", conversationId);
+        index.put("formatVersion", 2);
         var entries = index.putArray("receipts");
-        for (var receipt : ordered) {
-            if (!receipt.substantive()) continue;
+        for (var receipt : ordered.reversed()) {
+            if (!receipt.recoverable()) continue;
             var entry = entries.addObject();
             entry.put("toolCallId", receipt.toolCallId());
             entry.put("toolName", receipt.toolName());
             entry.put("status", receipt.status().name());
             entry.put("argumentsPreview", receipt.argumentsPreview());
-            entry.put("resultSummary", receipt.resultSummary());
+            entry.put("completedAt", receipt.completedAt());
+            // 目录只提供定位信息，避免读取正文及嵌套转义反复膨胀。
             entry.put("resultRef", receipt.resultRef());
         }
         if (entries.isEmpty()) return this;
-        String path = storage.preserveRecoveryIndex(index.toString(), ordered.getFirst().toolCallId(),
+        String path = storage.preserveRecoveryIndex(index.toPrettyString(), ordered.getFirst().toolCallId(),
                 conversationId, workspaceBasePath);
         return path == null ? this : new ActionExecutionLedger(receipts, path);
     }
@@ -162,15 +185,28 @@ public final class ActionExecutionLedger {
      * @return 给模型的有界执行事实；纯发现调用返回空字符串
      */
     public String renderAnswerFacts() {
+        return renderAnswerFacts(Set.of(), "");
+    }
+
+    /**
+     * 按当前工作引用和已可见工具结果装配事实，避免在前缀重复发送相同正文。
+     * @param visibleIds 已在当前历史中可见的工具调用标识
+     * @param workingText 当前目标、步骤与待办的说明，只用于选择真实引用
+     * @return 有界执行事实与已读资料目录，模型备注不成为执行证明
+     */
+    public String renderAnswerFacts(Set<String> visibleIds, String workingText) {
         List<Receipt> failures = receipts.values().stream()
                 .filter(receipt -> receipt.status() == Status.FAILED)
                 .sorted(Comparator.comparingLong(Receipt::completedAt).thenComparing(Receipt::toolCallId))
                 .toList();
         List<Receipt> successes = receipts.values().stream()
-                .filter(receipt -> receipt.status() == Status.SUCCEEDED && receipt.substantive())
+                .filter(receipt -> receipt.status() == Status.SUCCEEDED && receipt.recoverable() && !receipt.material())
                 .sorted(Comparator.comparingLong(Receipt::completedAt).reversed().thenComparing(Receipt::toolCallId))
                 .toList();
-        if (failures.isEmpty() && successes.isEmpty()) return "";
+        var materials = receipts.values().stream().filter(Receipt::material)
+                .filter(receipt -> receipt.status() == Status.SUCCEEDED)
+                .sorted(Comparator.comparingLong(Receipt::completedAt).reversed()).toList();
+        if (failures.isEmpty() && successes.isEmpty() && materials.isEmpty()) return "";
 
         var facts = new ObjectMapper().createObjectNode();
         facts.put("failedCallCount", failures.size());
@@ -183,22 +219,42 @@ public final class ActionExecutionLedger {
             var failure = failedCalls.addObject();
             failure.put("toolCallId", identifierPreview(receipt.toolCallId()));
             failure.put("toolName", identifierPreview(receipt.toolName()));
-            failure.put("resultSummary", receipt.resultSummary());
+            failure.put("resultSummary", identifierPreview(receipt.resultSummary()));
             failure.put("resultRef", receipt.resultRef());
         }
         facts.put("omittedFailedCallCount", Math.max(0, failures.size() - 12));
         facts.put("successfulSubstantiveCallCount", successes.size());
         var successfulCalls = facts.putArray("successfulSubstantiveCalls");
-        // Retain the latest substantive outputs after aged tool history has
-        // been cleared. Discovery/progress receipts add no result evidence.
-        for (Receipt receipt : successes.stream().limit(24).toList()) {
+        // 优先选择工作集引用及近期实质回执，发现和进度调用不提供执行结果证据。
+        var selected = new LinkedHashMap<String, Receipt>();
+        for (Receipt receipt : successes) {
+            if (workingText != null && (workingText.contains(receipt.toolCallId())
+                    || (receipt.resultRef() != null && workingText.contains(receipt.resultRef())))) {
+                if (selected.size() < 8) selected.put(receipt.toolCallId(), receipt);
+            }
+        }
+        successes.stream().limit(8).forEach(receipt -> selected.putIfAbsent(receipt.toolCallId(), receipt));
+        for (Receipt receipt : selected.values()) {
             var success = successfulCalls.addObject();
             success.put("toolCallId", identifierPreview(receipt.toolCallId()));
             success.put("toolName", identifierPreview(receipt.toolName()));
-            success.put("resultSummary", receipt.resultSummary());
+            if (!visibleIds.contains(receipt.toolCallId())) {
+                success.put("resultSummary", receipt.resultSummary().length() <= MAX_RESULT_SUMMARY_CHARS || receipt.resultRef() == null
+                        ? receipt.resultSummary() : identifierPreview(receipt.resultSummary()));
+            }
             success.put("resultRef", receipt.resultRef());
         }
-        facts.put("omittedSuccessfulSubstantiveCallCount", Math.max(0, successes.size() - 24));
+        facts.put("omittedSuccessfulSubstantiveCallCount", Math.max(0, successes.size() - selected.size()));
+        var knownMaterials = facts.putArray("alreadyReadMaterials");
+        var sources = new java.util.HashSet<String>();
+        for (Receipt receipt : materials) {
+            String source = receipt.toolName() + ":" + receipt.argumentsPreview();
+            if (knownMaterials.size() >= 16 || !sources.add(source)) continue;
+            var material = knownMaterials.addObject();
+            material.put("toolCallId", receipt.toolCallId());
+            material.put("source", receipt.argumentsPreview());
+            material.put("resultRef", receipt.resultRef());
+        }
         String failureInstruction = failures.isEmpty() ? "" : """
                 Answer consistency requirement: failed calls occurred. Do not claim that every execution succeeded,
                 that no errors occurred, or that there were zero failures. If discussing execution, distinguish
@@ -215,33 +271,52 @@ public final class ActionExecutionLedger {
                 status or reconstruct cleared outputs from memory. These summaries may be truncated or omit
                 older calls; retrieve the original result if needed rather than guessing missing values.
                 Keep every section of the answer consistent with the execution facts.
-                工具回执恢复：receiptIndexPath 可用时，用 read_file 读取本轮索引，再按 resultRef 读取原文。
+                工具回执恢复：已知 resultRef 时直接读取原文，无需先读取目录；目录按近期优先分行，截断时按游标继续。
                 摘要省略或历史被裁剪不代表执行结果不存在；恢复历史结果不能再次执行领取、创建、发送或提交。
-                领取或创建成功后，用 progress_update 记录实际返回的标识、请求标识及下一步，
-                完成取证和提交后再推进下一批；同案已读取的工具说明和规范优先复用。
+                alreadyReadMaterials 是本轮已读资料：复用已取得的规则和契约，只有缺少具体内容或版本变化时才按引用读取。
+                当前步骤、约束与待办由进度台账保留；只在步骤实质变化时更新，进度文字不等于执行成功。
                 用户明确要求的新一轮操作仍按本轮授权执行，不根据旧回执自动跳过。
                 %s
                 """.formatted(facts, failureInstruction);
     }
 
+    /** 为提示保留有界标识或摘要，完整内容仍可通过原文读取。 */
     private static String identifierPreview(String value) {
         if (value == null) return "";
         return value.length() <= 96 ? value : value.substring(0, 93) + "...";
     }
 
+    /** @return 当前轮次的全部真实执行记录 */
     public Map<String, Receipt> receipts() {
         return receipts;
     }
 
+    /** @return 当前轮次的只读回执目录，没有成功保存时为空 */
+    public String recoveryIndexPath() {
+        return recoveryIndexPath;
+    }
+
+    /** @return 最近真实执行完成时刻，用于区分仍在取证的任务与完全静默的运行 */
+    public long lastCompletedAt() {
+        return receipts.values().stream().mapToLong(Receipt::completedAt).max().orElse(0);
+    }
+
+    /** @return 是否存在真实业务或取证调用 */
     public boolean hasSubstantiveAttempt() {
         return receipts.values().stream().anyMatch(Receipt::substantive);
     }
 
+    /** @return 是否存在成功返回的业务或取证调用，不代表任务完成 */
     public boolean hasSuccessfulSubstantiveCall() {
         return receipts.values().stream()
                 .anyMatch(receipt -> receipt.substantive() && receipt.status() == Status.SUCCEEDED);
     }
 
+    /**
+     * 查询指定工具是否已实际成功执行，不推断对应业务步骤完成。
+     * @param toolName 需要核对的工具名称
+     * @return 是否存在该工具的成功执行记录
+     */
     public boolean hasSuccessfulTool(String toolName) {
         return receipts.values().stream().anyMatch(receipt ->
                 receipt.status() == Status.SUCCEEDED && receipt.toolName().equals(toolName));

@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+/** 验证工具执行事实与资料引用不被模型进度或历史裁剪替代。 */
 class ActionExecutionLedgerTest {
 
     @Test
@@ -43,6 +44,7 @@ class ActionExecutionLedgerTest {
         assertEquals("", ActionExecutionLedger.empty().renderAnswerFacts());
     }
 
+    /** 有界展示最近事实，完整数量及早期恢复入口保持准确。 */
     @Test
     void successfulResultSamplesKeepLatestSubstantiveCallsAndExactOmittedCounts() {
         var events = new java.util.ArrayList<GraphEventPublisher.GraphEvent>();
@@ -56,15 +58,17 @@ class ActionExecutionLedgerTest {
         assertTrue(facts.contains("value-29"));
         assertFalse(facts.contains("value-0\""));
         assertFalse(facts.contains("do not preserve"));
-        assertTrue(facts.contains("\"omittedSuccessfulSubstantiveCallCount\":6"));
+        assertTrue(facts.contains("\"omittedSuccessfulSubstantiveCallCount\":22"));
     }
 
+    /** 发现调用提供资料复用信息，但不成为业务执行成功证据。 */
     @Test
     void disclosureOnlyRunAddsNoAnswerFacts() {
         var ledger = ActionExecutionLedger.fromEvents(List.of(
                 GraphEventPublisher.toolComplete("load", "load_skill", "skill", true),
                 GraphEventPublisher.toolComplete("describe", "tool_describe", "schema", true)));
-        assertEquals("", ledger.renderAnswerFacts());
+        assertTrue(ledger.renderAnswerFacts().contains("alreadyReadMaterials"));
+        assertFalse(ledger.hasSuccessfulSubstantiveCall());
     }
 
     @Test

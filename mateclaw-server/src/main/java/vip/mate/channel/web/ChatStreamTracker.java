@@ -245,6 +245,9 @@ public class ChatStreamTracker {
         /** 创建时间（用于 stale 检测和清理） */
         final long createdAt = System.currentTimeMillis();
 
+        /** 最后一个运行段的完成时刻，完成后回放保留期从此计算。 */
+        volatile long completedAt;
+
         /**
          * Wall-clock millis of the most recent meaningful event on this run.
          * Updated whenever {@link #broadcast(String, String, String)} pushes a
@@ -1449,6 +1452,7 @@ public class ChatStreamTracker {
         return handle != null && complete(handle.state);
     }
 
+    /** 最后一个运行段完成时记录完成时间，从该时刻起保留回放窗口。 */
     private boolean complete(RunState state) {
         String conversationId = state.conversationId;
         // Some terminal paths do not publish a done envelope. Flush visible
@@ -1467,6 +1471,7 @@ public class ChatStreamTracker {
                 return false;
             }
             state.done = true;
+            state.completedAt = System.currentTimeMillis();
             state.cancellationHooks.clear();
             state.termination.complete(null);
             oldHeartbeat = state.heartbeatFuture;
@@ -1490,7 +1495,8 @@ public class ChatStreamTracker {
      * 将「递减计数 → 消费 queue → 删除 RunState」三步收口到同一个临界区，
      * 避免非最后一个 flux 提前 consume 导致 queue 丢失，也避免 complete 后查不到 queue。
      *
-     * @return CompletionResult(allDone, queuedInput)
+     * @param conversationId 已认证的会话标识
+     * @return 是否完成全部运行段，完成时间用于后续回放保留期
      */
     public CompletionResult completeAndConsumeIfLast(String conversationId) {
         RunState state = runs.get(conversationId);
@@ -1510,6 +1516,7 @@ public class ChatStreamTracker {
                 return new CompletionResult(false);
             }
             state.done = true;
+            state.completedAt = System.currentTimeMillis();
             state.cancellationHooks.clear();
             state.termination.complete(null);
             oldHeartbeat = state.heartbeatFuture;
@@ -2109,11 +2116,11 @@ public class ChatStreamTracker {
 
     /**
      * 定期清理过期的 RunState，防止内存泄漏。
-     * - 已完成超过 {@link #DONE_RETENTION_MS} 的 → 移除
-     * - 自 {@link RunState#lastEventAt} 算起静默超过
+     * - 从最后运行段完成时刻起超过 {@link #DONE_RETENTION_MS} 的已完成运行 → 移除
+     * - 尚未完成且自 {@link RunState#lastEventAt} 算起静默超过
      *   {@link #idleTimeoutMinutes} 分钟的 → 强制移除（视为卡死）
      * - 订阅者清零超过 {@link #orphanGraceSeconds} 且仍在运行的孤儿 →
-     *   移除（webchat 无重连端点，运行对调用方不可见不可达，见 #587）
+     *   移除；有界重连应在孤儿保留窗口内恢复订阅
      */
     @org.springframework.scheduling.annotation.Scheduled(
             fixedDelay = STALE_RUN_SWEEP_INTERVAL_MS)
@@ -2136,7 +2143,7 @@ public class ChatStreamTracker {
                     Long orphanSince = state.subscribersZeroSince;
                     long orphanMs = orphanSince != null ? now - orphanSince : -1L;
 
-                    if (state.done && age > DONE_RETENTION_MS) {
+                    if (state.done && now - state.completedAt > DONE_RETENTION_MS) {
                         reason = "completed and expired";
                     } else if (!state.done && state.subscribers.isEmpty()
                             && orphanSince != null && orphanMs > orphanGraceMs) {
@@ -2148,7 +2155,7 @@ public class ChatStreamTracker {
                         // nobody is watching those events.
                         reason = "orphaned: no subscribers for " + (orphanMs / 1000)
                                 + "s (grace " + orphanGraceSeconds + "s); run still active";
-                    } else if (idleMs > idleThresholdMs) {
+                    } else if (!state.done && idleMs > idleThresholdMs) {
                         reason = "idle for " + (idleMs / 1000) + "s (threshold "
                                 + idleTimeoutMinutes + "min); total wall-clock age "
                                 + (age / 1000) + "s";

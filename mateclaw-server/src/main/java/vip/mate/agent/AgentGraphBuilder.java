@@ -853,6 +853,7 @@ public class AgentGraphBuilder {
                 primaryModelConfig, agentId, skillCatalogRenderer, null, Set.of());
     }
 
+    /** 构建原生 ReAct 工作流，传入已确认思考能力，并配置可恢复的摘要独立输入预算。 */
     AgentRuntime buildReActGraph(AgentToolSet toolSet, ChatModel chatModel, int maxIterations,
                                    String reasoningEffort, ModelConfigEntity primaryModelConfig,
                                    Long agentId, SkillCatalogRenderer skillCatalogRenderer,
@@ -927,6 +928,10 @@ public class AgentGraphBuilder {
             ObservationProcessor observationProcessor = new ObservationProcessor(graphObservationProperties);
             ObservationNode observationNode = new ObservationNode(observationProcessor, streamTracker);
             SummarizingNode summarizingNode = new SummarizingNode(chatModel, streamingHelper, streamTracker);
+            summarizingNode.configureInput(toolResultStorage, progressLedgerService,
+                    prefixBudgetPlan == null ? graphObservationProperties.getSummaryInputMaxTokens()
+                            : Math.min(graphObservationProperties.getSummaryInputMaxTokens(),
+                                    Math.max(1, prefixBudgetPlan.effectiveMaxTokens() - 4096)));
             LimitExceededNode limitExceededNode = new LimitExceededNode(
                     chatModel, observationProcessor, streamingHelper, i18nService, progressLedgerService);
             limitExceededNode.setPrefixBudgetPlan(prefixBudgetPlan);
